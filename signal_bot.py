@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Standalone trading signal bot — BTC only, two-step verified.
+Standalone trading signal bot — BTC only, dual-strategy confirmation.
 
-Polls BTC-USD price data on a schedule and checks two independent
-strategies on direction:
+Polls BTC-USD price data on a schedule and only fires an alert when TWO
+independent strategies agree on direction:
 
   Strategy 1 (trend):     EMA9/EMA21 crossover, filtered by RSI band
   Strategy 2 (momentum):  MACD line/signal crossover with a positive/
