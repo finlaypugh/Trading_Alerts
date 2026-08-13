@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-Standalone trading signal bot — BTC only, dual-strategy confirmation.
+Standalone trading signal bot — BTC only, two-step verified.
 
-Polls BTC-USD price data on a schedule and only fires an alert when TWO
-independent strategies agree on direction:
+Polls BTC-USD price data on a schedule and checks two independent
+strategies on direction:
 
   Strategy 1 (trend):     EMA9/EMA21 crossover, filtered by RSI band
   Strategy 2 (momentum):  MACD line/signal crossover with a positive/
                            negative histogram in the same direction
 
-A signal only fires when both strategies agree. The alert also includes
-a suggested stop-loss and take-profit, derived from ATR (volatility) and
-scaled by how strong the combined signal is (stronger agreement = wider
-take-profit target, since a higher-confidence move is given more room to run).
+If BOTH strategies agree, a STRONG alert fires. If only ONE of the two
+agrees, a WEAK alert still fires (rather than being suppressed) so you
+don't miss a potential move -- it's just clearly labeled as unconfirmed,
+and the alert names exactly which strategy triggered it. If the two
+strategies point in opposite directions, nothing fires (contradictory
+signals aren't actionable either way).
+
+The alert also includes a suggested stop-loss and take-profit, derived
+from ATR (volatility) and scaled by signal strength (stronger agreement
+= wider take-profit target, since a higher-confidence move is given more
+room to run).
 
 This script never places trades — it only sends notifications for you to
 act on manually.
@@ -61,20 +68,30 @@ TP_RR_MAX = float(os.environ.get("SIGNAL_TP_RR_MAX", 3.0))       # reward:risk f
 POLL_SECONDS = int(os.environ.get("SIGNAL_POLL_SECONDS", 900))   # 15 min default
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]          # required, no default
 
+# Display names used in alerts to say exactly which strategy fired.
+STRAT1_NAME = f"EMA{FAST_EMA}/{SLOW_EMA}+RSI{RSI_LEN}"
+STRAT2_NAME = f"MACD{MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL}"
+
+# Weak (single-strategy) signals are always scored below this ceiling so
+# they can never read as more confident than a fully-confirmed signal.
+WEAK_STRENGTH_CAP = float(os.environ.get("SIGNAL_WEAK_STRENGTH_CAP", 0.5))
+
 STATE_FILE = Path(__file__).parent / f".state_{TICKER.replace('/', '_')}.json"
 
 
 def load_last_signal():
+    """Returns (last_signal, last_confirmed) -- (None, None) if no state yet."""
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text()).get("last_signal")
+            data = json.loads(STATE_FILE.read_text())
+            return data.get("last_signal"), data.get("last_confirmed")
         except (json.JSONDecodeError, OSError):
-            return None
-    return None
+            return None, None
+    return None, None
 
 
-def save_last_signal(signal):
-    STATE_FILE.write_text(json.dumps({"last_signal": signal}))
+def save_last_signal(signal, confirmed):
+    STATE_FILE.write_text(json.dumps({"last_signal": signal, "last_confirmed": confirmed}))
 
 
 def compute_indicators(df):
