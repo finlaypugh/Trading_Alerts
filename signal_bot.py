@@ -80,18 +80,31 @@ STATE_FILE = Path(__file__).parent / f".state_{TICKER.replace('/', '_')}.json"
 
 
 def load_last_signal():
-    """Returns (last_signal, last_confirmed) -- (None, None) if no state yet."""
-    if STATE_FILE.exists():
-        try:
-            data = json.loads(STATE_FILE.read_text())
-            return data.get("last_signal"), data.get("last_confirmed")
-        except (json.JSONDecodeError, OSError):
-            return None, None
-    return None, None
+    """Return the last sent signal (e.g. "BUY"/"SELL") or None if missing/corrupt.
+
+    Historically this module exposed a simple single-value persistence API
+    used in tests and in run-time. The previous implementation returned a
+    tuple and required a separate "confirmed" field; that made callers and
+    tests diverge. Use a single-value API for backwards compatibility with
+    the test-suite: save_last_signal(value) / load_last_signal() -> value|None.
+    """
+    try:
+        text = STATE_FILE.read_text()
+    except (FileNotFoundError, OSError):
+        return None
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
 
 
-def save_last_signal(signal, confirmed):
-    STATE_FILE.write_text(json.dumps({"last_signal": signal, "last_confirmed": confirmed}))
+def save_last_signal(signal):
+    """Persist a simple last-signal value (string or JSON-serializable object).
+
+    Overwrites any previous value in STATE_FILE.
+    """
+    STATE_FILE.write_text(json.dumps(signal))
 
 
 def compute_indicators(df):
@@ -249,13 +262,13 @@ def run_once():
 
     df = compute_indicators(df)
     signal, strength = detect_signal(df)
-    last_signal, last_confirmed = load_last_signal()
+    last_signal = load_last_signal()
 
     if signal and signal != last_signal:
         latest = df.iloc[-1]
         sl, tp, rr = build_sl_tp(signal, latest["Close"], latest["atr"], strength)
         send_discord_alert(signal, latest["Close"], latest["rsi"], latest["atr"], strength, sl, tp, rr)
-        save_last_signal(signal, True)
+        save_last_signal(signal)
         print(f"[{TICKER}] sent {signal} alert @ {latest['Close']:.2f} (strength {strength:.2f})")
     else:
         print(f"[{TICKER}] no new confirmed signal (last sent: {last_signal})")
