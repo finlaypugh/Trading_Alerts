@@ -249,13 +249,13 @@ def run_once():
 
     df = compute_indicators(df)
     signal, strength = detect_signal(df)
-    last_signal = load_last_signal()
+    last_signal, last_confirmed = load_last_signal()
 
     if signal and signal != last_signal:
         latest = df.iloc[-1]
         sl, tp, rr = build_sl_tp(signal, latest["Close"], latest["atr"], strength)
         send_discord_alert(signal, latest["Close"], latest["rsi"], latest["atr"], strength, sl, tp, rr)
-        save_last_signal(signal)
+        save_last_signal(signal, True)
         print(f"[{TICKER}] sent {signal} alert @ {latest['Close']:.2f} (strength {strength:.2f})")
     else:
         print(f"[{TICKER}] no new confirmed signal (last sent: {last_signal})")
