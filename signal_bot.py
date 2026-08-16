@@ -153,56 +153,65 @@ def _clip01(x):
 
 def detect_signal(df):
     """
-    Require BOTH strategies to agree on direction using the last two closed
-    candles. Returns (signal, strength) where strength is 0-1 (0 = just
-    barely qualifies, 1 = maximally strong agreement), or (None, 0).
+    Returns (signal, strength, confirmed, contributing) where:
+      - signal: "BUY" / "SELL" / None
+      - strength: 0-1
+      - confirmed: True if BOTH strategies agree (STRONG), False if only one (WEAK)
+      - contributing: strategy name(s) that fired, or None
+    Contradictory signals (strategies disagree) return (None, 0.0, False, None).
     """
     if len(df) < MIN_BARS:
-        return None, 0.0
+        return None, 0.0, False, None
 
     prev, curr = df.iloc[-2], df.iloc[-1]
 
-    # Strategy 1: EMA crossover + RSI band
     ema_crossed_up = prev["ema_fast"] <= prev["ema_slow"] and curr["ema_fast"] > curr["ema_slow"]
     ema_crossed_down = prev["ema_fast"] >= prev["ema_slow"] and curr["ema_fast"] < curr["ema_slow"]
     rsi_ok_buy = RSI_MIN < curr["rsi"] < RSI_MAX
-    rsi_ok_sell = curr["rsi"] < (100 - RSI_MIN)  # symmetric-ish guard against selling into deep oversold
+    rsi_ok_sell = curr["rsi"] < (100 - RSI_MIN)
 
     strat1_buy = ema_crossed_up and rsi_ok_buy
     strat1_sell = ema_crossed_down and rsi_ok_sell
 
-    # Strategy 2: MACD line/signal crossover, histogram confirms direction
     macd_crossed_up = prev["macd"] <= prev["macd_signal"] and curr["macd"] > curr["macd_signal"]
     macd_crossed_down = prev["macd"] >= prev["macd_signal"] and curr["macd"] < curr["macd_signal"]
 
     strat2_buy = macd_crossed_up and curr["macd_hist"] > 0
     strat2_sell = macd_crossed_down and curr["macd_hist"] < 0
 
-    signal = None
-    if strat1_buy and strat2_buy:
-        signal = "BUY"
-    elif strat1_sell and strat2_sell:
-        signal = "SELL"
+    strat1_dir = "BUY" if strat1_buy else "SELL" if strat1_sell else None
+    strat2_dir = "BUY" if strat2_buy else "SELL" if strat2_sell else None
 
-    if signal is None:
-        return None, 0.0
+    if strat1_dir is None and strat2_dir is None:
+        return None, 0.0, False, None
 
-    # --- Strength score: how convincingly both strategies agree ---
-    # RSI component: distance from the band's edges (more central = stronger)
+    # Contradictory: strategies disagree on direction -> no alert
+    if strat1_dir and strat2_dir and strat1_dir != strat2_dir:
+        return None, 0.0, False, None
+
+    if strat1_dir and strat2_dir:
+        signal, confirmed, contributing = strat1_dir, True, f"{STRAT1_NAME} + {STRAT2_NAME}"
+    elif strat1_dir:
+        signal, confirmed, contributing = strat1_dir, False, STRAT1_NAME
+    else:
+        signal, confirmed, contributing = strat2_dir, False, STRAT2_NAME
+
+    # --- Strength score (same as before) ---
     rsi_mid = (RSI_MIN + RSI_MAX) / 2
     rsi_half_width = (RSI_MAX - RSI_MIN) / 2
     rsi_score = _clip01(1 - abs(curr["rsi"] - rsi_mid) / rsi_half_width) if rsi_half_width else 0.5
 
-    # MACD component: histogram size relative to its recent volatility
     recent_hist_std = df["macd_hist"].tail(50).std()
     macd_score = _clip01(abs(curr["macd_hist"]) / (2 * recent_hist_std)) if recent_hist_std else 0.5
 
-    # EMA separation component: gap between EMAs relative to ATR (bigger = more decisive cross)
     ema_gap = abs(curr["ema_fast"] - curr["ema_slow"])
-    ema_score = _clip01(ema_gap / (curr["atr"])) if curr["atr"] else 0.5
+    ema_score = _clip01(ema_gap / curr["atr"]) if curr["atr"] else 0.5
 
     strength = (rsi_score + macd_score + ema_score) / 3
-    return signal, strength
+    if not confirmed:
+        strength = min(strength, WEAK_STRENGTH_CAP)
+
+    return signal, strength, confirmed, contributing
 
 
 def build_sl_tp(signal, price, atr, strength):
@@ -222,20 +231,20 @@ def build_sl_tp(signal, price, atr, strength):
     return sl, tp, rr
 
 
-def send_discord_alert(signal, price, rsi, atr, strength, sl, tp, rr):
+def send_discord_alert(signal, price, rsi, atr, strength, sl, tp, rr, confirmed, contributing):
     emoji = "\U0001F7E2" if signal == "BUY" else "\U0001F534"
     stars = "\u2B50" * max(1, round(strength * 5))
+    tier = "STRONG (confirmed)" if confirmed else f"WEAK (unconfirmed \u2014 only {contributing} fired)"
     content = (
-        f"{emoji} **{signal}** {TICKER} @ {price:,.2f}\n"
-        f"Confirmed by EMA{FAST_EMA}/{SLOW_EMA}+RSI and MACD{MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL} "
-        f"(RSI {rsi:.1f})\n"
+        f"{emoji} **{signal}** {TICKER} @ {price:,.2f} \u2014 {tier}\n"
+        f"Triggered by: {contributing}\n"
+        f"RSI {rsi:.1f}\n"
         f"Signal strength: {strength * 100:.0f}% {stars}\n"
         f"SL: {sl:,.2f}  |  TP: {tp:,.2f}  |  R:R \u2248 1:{rr:.2f}\n"
         f"_Not financial advice — informational only, act at your own discretion._"
     )
     resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)
     resp.raise_for_status()
-
 
 def send_startup_message():
     content = (
@@ -261,18 +270,25 @@ def run_once():
         df.columns = df.columns.get_level_values(0)
 
     df = compute_indicators(df)
-    signal, strength = detect_signal(df)
-    last_signal = load_last_signal()
+    signal, strength, confirmed, contributing = detect_signal(df)
+    last_state = load_last_signal() or {}
+    last_signal = last_state.get("signal")
+    last_confirmed = last_state.get("confirmed", False)
 
-    if signal and signal != last_signal:
+    should_alert = signal and (
+            signal != last_signal or (confirmed and not last_confirmed)
+    )
+
+    if should_alert:
         latest = df.iloc[-1]
         sl, tp, rr = build_sl_tp(signal, latest["Close"], latest["atr"], strength)
-        send_discord_alert(signal, latest["Close"], latest["rsi"], latest["atr"], strength, sl, tp, rr)
-        save_last_signal(signal)
-        print(f"[{TICKER}] sent {signal} alert @ {latest['Close']:.2f} (strength {strength:.2f})")
+        send_discord_alert(signal, latest["Close"], latest["rsi"], latest["atr"],
+                           strength, sl, tp, rr, confirmed, contributing)
+        save_last_signal({"signal": signal, "confirmed": confirmed})
+        tier = "STRONG" if confirmed else "WEAK"
+        print(f"[{TICKER}] sent {tier} {signal} alert @ {latest['Close']:.2f} (strength {strength:.2f})")
     else:
-        print(f"[{TICKER}] no new confirmed signal (last sent: {last_signal})")
-
+        print(f"[{TICKER}] no new signal to send (last: {last_signal}, confirmed={last_confirmed})")
 
 if __name__ == "__main__":
     print(
