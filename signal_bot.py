@@ -2,19 +2,31 @@
 """
 Standalone trading signal bot — BTC only, dual-strategy confirmation.
 
-Polls BTC-USD price data on a schedule and only fires an alert when TWO
-independent strategies agree on direction:
+Polls BTC-USD price data on a schedule and combines two independent
+strategies: one supplies the entry *event*, the other supplies the market
+*regime* that event has to happen in.
 
-  Strategy 1 (trend):     EMA9/EMA21 crossover, filtered by RSI band
-  Strategy 2 (momentum):  MACD line/signal crossover with a positive/
-                           negative histogram in the same direction
+  Strategy 1 (trigger):  Williams Fractals breakout. A fractal is a swing
+                         pivot confirmed n bars after it forms. Fractals
+                         alone are not directional, so the tradable event
+                         is price closing through the most recently
+                         confirmed pivot: above the last up-fractal high
+                         (buy) or below the last down-fractal low (sell).
 
-If BOTH strategies agree, a STRONG alert fires. If only ONE of the two
-agrees, a WEAK alert still fires (rather than being suppressed) so you
-don't miss a potential move -- it's just clearly labeled as unconfirmed,
-and the alert names exactly which strategy triggered it. If the two
-strategies point in opposite directions, nothing fires (contradictory
-signals aren't actionable either way).
+  Strategy 2 (regime):   Triple EMA 50/100/200 stack. Bullish when
+                         ema1 > ema2 > ema3 and price is above ema1;
+                         bearish when the stack is inverted and price is
+                         below ema1; neutral otherwise.
+
+The two are deliberately asymmetric. Requiring both to *cross* on the same
+candle would fire approximately never — a 200-period EMA stack flips
+direction a handful of times a month. So the fractal break is the trigger
+and the EMA stack is the confirming state:
+
+  break + matching regime   -> STRONG alert
+  break + neutral regime    -> WEAK alert (capped strength, clearly labeled)
+  break + opposing regime   -> nothing (a contradiction is not actionable)
+  no break                  -> nothing (regime alone gives no entry bar)
 
 The alert also includes a suggested stop-loss and take-profit, derived
 from ATR (volatility) and scaled by signal strength (stronger agreement
@@ -37,27 +49,31 @@ import os
 import time
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
 
 # ---- Config (override via environment variables) ----
 TICKER = os.environ.get("SIGNAL_TICKER", "BTC-USD")          # Yahoo Finance ticker symbol
-INTERVAL = os.environ.get("SIGNAL_INTERVAL", "15m")          # 1m,5m,15m,1h,1d ...
+INTERVAL = os.environ.get("SIGNAL_INTERVAL", "5m")           # 1m,5m,15m,1h,1d ...
 LOOKBACK = os.environ.get("SIGNAL_LOOKBACK", "5d")           # history window to pull each poll
 
-# Strategy 1: EMA crossover + RSI filter
-FAST_EMA = int(os.environ.get("SIGNAL_FAST_EMA", 9))
-SLOW_EMA = int(os.environ.get("SIGNAL_SLOW_EMA", 21))
-RSI_LEN = int(os.environ.get("SIGNAL_RSI_LEN", 14))
-RSI_MIN = float(os.environ.get("SIGNAL_RSI_MIN", 40))
-RSI_MAX = float(os.environ.get("SIGNAL_RSI_MAX", 70))
+# Strategy 1: Williams Fractals
+FRACTAL_N = int(os.environ.get("SIGNAL_FRACTAL_N", 2))       # bars either side of the pivot
+FRACTAL_MAX_PLATEAU = int(os.environ.get("SIGNAL_FRACTAL_MAX_PLATEAU", 4))  # equal-high run allowed on the left
 
-# Strategy 2: MACD crossover
-MACD_FAST = int(os.environ.get("SIGNAL_MACD_FAST", 12))
-MACD_SLOW = int(os.environ.get("SIGNAL_MACD_SLOW", 26))
-MACD_SIGNAL = int(os.environ.get("SIGNAL_MACD_SIGNAL", 9))
+if FRACTAL_N < 2:
+    raise ValueError(
+        f"SIGNAL_FRACTAL_N must be >= 2 (got {FRACTAL_N}); "
+        f"a fractal needs at least two bars either side of the pivot"
+    )
+if FRACTAL_MAX_PLATEAU < 0:
+    raise ValueError(f"SIGNAL_FRACTAL_MAX_PLATEAU must be >= 0 (got {FRACTAL_MAX_PLATEAU})")
+
+# Strategy 2: Triple EMA
+EMA_1 = int(os.environ.get("SIGNAL_EMA_1", 50))
+EMA_2 = int(os.environ.get("SIGNAL_EMA_2", 100))
+EMA_3 = int(os.environ.get("SIGNAL_EMA_3", 200))
 
 # Volatility / risk management
 ATR_LEN = int(os.environ.get("SIGNAL_ATR_LEN", 14))
@@ -69,8 +85,8 @@ POLL_SECONDS = int(os.environ.get("SIGNAL_POLL_SECONDS", 900))   # 15 min defaul
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]          # required, no default
 
 # Display names used in alerts to say exactly which strategy fired.
-STRAT1_NAME = f"EMA{FAST_EMA}/{SLOW_EMA}+RSI{RSI_LEN}"
-STRAT2_NAME = f"MACD{MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL}"
+STRAT1_NAME = f"Fractals(n={FRACTAL_N})"
+STRAT2_NAME = f"TEMA{EMA_1}/{EMA_2}/{EMA_3}"
 
 # Weak (single-strategy) signals are always scored below this ceiling so
 # they can never read as more confident than a fully-confirmed signal.
@@ -78,45 +94,89 @@ WEAK_STRENGTH_CAP = float(os.environ.get("SIGNAL_WEAK_STRENGTH_CAP", 0.5))
 
 STATE_FILE = Path(__file__).parent / f".state_{TICKER.replace('/', '_')}.json"
 
+# Enough history for the slowest EMA to settle, plus a full fractal window
+# (n bars either side of a pivot, plus the n-bar confirmation delay).
+MIN_BARS = max(EMA_3 * 2, ATR_LEN * 2, (2 * FRACTAL_N) + 1 + FRACTAL_N)
+
 
 def load_last_signal():
-    """Returns (last_signal, last_confirmed) -- (None, None) if no state yet."""
-    if STATE_FILE.exists():
-        try:
-            data = json.loads(STATE_FILE.read_text())
-            return data.get("last_signal"), data.get("last_confirmed")
-        except (json.JSONDecodeError, OSError):
-            return None, None
-    return None, None
+    """Return the last alert as {"signal": ..., "tier": ...}, or None."""
+    if not STATE_FILE.exists():
+        return None
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    # Older versions stored a bare direction string. Treat those as STRONG so
+    # an existing state file cannot replay as a spurious WEAK->STRONG upgrade.
+    if isinstance(data, str):
+        return {"signal": data, "tier": "STRONG"}
+    if isinstance(data, dict) and data.get("signal"):
+        return {"signal": data["signal"], "tier": data.get("tier", "STRONG")}
+    return None
 
 
-def save_last_signal(signal, confirmed):
-    STATE_FILE.write_text(json.dumps({"last_signal": signal, "last_confirmed": confirmed}))
+def save_last_signal(signal, tier):
+    STATE_FILE.write_text(json.dumps({"signal": signal, "tier": tier}))
+
+
+def _fractal_mask(series, n, max_plateau, up=True):
+    """
+    Boolean Series: True on bars that are a Williams fractal pivot.
+
+    Port of the Pine implementation. In Pine, high[k] is k bars *ago*, so
+    for a pivot candidate high[n]: high[n-i] are the newer bars to its
+    right and high[n+i] the older bars to its left. The right side must be
+    strictly beaten by the pivot; the left side allows a run of up to
+    max_plateau equal bars immediately adjacent before the strict
+    requirement kicks in, which is what lets a flat double top still count.
+    """
+    cmp_strict = (lambda a, b: a < b) if up else (lambda a, b: a > b)
+    cmp_eq_ok = (lambda a, b: a <= b) if up else (lambda a, b: a >= b)
+
+    # Right side (newer bars, p+1 .. p+n): all strictly beaten by the pivot.
+    right = pd.Series(True, index=series.index)
+    for i in range(1, n + 1):
+        right &= cmp_strict(series.shift(-i), series)
+
+    # Left side (older bars): try every plateau length and OR them together.
+    left = pd.Series(False, index=series.index)
+    for plateau in range(0, max_plateau + 1):
+        variant = pd.Series(True, index=series.index)
+        for j in range(1, plateau + 1):
+            variant &= cmp_eq_ok(series.shift(j), series)
+        for i in range(1, n + 1):
+            variant &= cmp_strict(series.shift(i + plateau), series)
+        left |= variant
+
+    return (right & left).fillna(False).astype(bool)
 
 
 def compute_indicators(df):
     df = df.copy()
 
-    # --- Strategy 1 inputs: EMA crossover + RSI ---
-    df["ema_fast"] = df["Close"].ewm(span=FAST_EMA, adjust=False).mean()
-    df["ema_slow"] = df["Close"].ewm(span=SLOW_EMA, adjust=False).mean()
+    # --- Strategy 2 inputs: triple EMA stack ---
+    df["ema_1"] = df["Close"].ewm(span=EMA_1, adjust=False).mean()
+    df["ema_2"] = df["Close"].ewm(span=EMA_2, adjust=False).mean()
+    df["ema_3"] = df["Close"].ewm(span=EMA_3, adjust=False).mean()
 
-    delta = df["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / RSI_LEN, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / RSI_LEN, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    df["rsi"] = 100 - (100 / (1 + rs))
+    # --- Strategy 1 inputs: Williams fractals ---
+    up_pivot = _fractal_mask(df["High"], FRACTAL_N, FRACTAL_MAX_PLATEAU, up=True)
+    down_pivot = _fractal_mask(df["Low"], FRACTAL_N, FRACTAL_MAX_PLATEAU, up=False)
+    df["up_fractal"] = up_pivot
+    df["down_fractal"] = down_pivot
 
-    # --- Strategy 2 inputs: MACD ---
-    ema_macd_fast = df["Close"].ewm(span=MACD_FAST, adjust=False).mean()
-    ema_macd_slow = df["Close"].ewm(span=MACD_SLOW, adjust=False).mean()
-    df["macd"] = ema_macd_fast - ema_macd_slow
-    df["macd_signal"] = df["macd"].ewm(span=MACD_SIGNAL, adjust=False).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
+    # The .shift(FRACTAL_N) below is the single most important line in this
+    # file. A pivot at bar p is only *knowable* at bar p + n, because the n
+    # bars to its right have to close first. Forward-filling the raw pivot
+    # would let the bot read levels that could not have existed at the time:
+    # it backtests beautifully and performs badly live. Shift first, ffill
+    # second.
+    df["fractal_high"] = df["High"].where(up_pivot).shift(FRACTAL_N).ffill()
+    df["fractal_low"] = df["Low"].where(down_pivot).shift(FRACTAL_N).ffill()
 
-    # --- Volatility: ATR (Wilder's) ---
+    # --- Volatility: ATR (Wilder smoothing) ---
     prev_close = df["Close"].shift(1)
     tr = pd.concat(
         [
@@ -131,65 +191,76 @@ def compute_indicators(df):
     return df
 
 
-MIN_BARS = max(SLOW_EMA, RSI_LEN, MACD_SLOW + MACD_SIGNAL, ATR_LEN) * 2  # let everything settle
-
-
 def _clip01(x):
     return max(0.0, min(1.0, x))
 
 
 def detect_signal(df):
     """
-    Require BOTH strategies to agree on direction using the last two closed
-    candles. Returns (signal, strength) where strength is 0-1 (0 = just
-    barely qualifies, 1 = maximally strong agreement), or (None, 0).
+    Fractal breakout supplies the trigger; the EMA stack supplies the
+    regime it has to happen in. Returns (signal, strength, tier, reason)
+    where strength is 0-1 and tier is "STRONG"/"WEAK", or
+    (None, 0.0, None, "") when nothing is actionable.
     """
     if len(df) < MIN_BARS:
-        return None, 0.0
+        return None, 0.0, None, ""
 
     prev, curr = df.iloc[-2], df.iloc[-1]
 
-    # Strategy 1: EMA crossover + RSI band
-    ema_crossed_up = prev["ema_fast"] <= prev["ema_slow"] and curr["ema_fast"] > curr["ema_slow"]
-    ema_crossed_down = prev["ema_fast"] >= prev["ema_slow"] and curr["ema_fast"] < curr["ema_slow"]
-    rsi_ok_buy = RSI_MIN < curr["rsi"] < RSI_MAX
-    rsi_ok_sell = curr["rsi"] < (100 - RSI_MIN)  # symmetric-ish guard against selling into deep oversold
+    # --- Strategy 1: fractal breakout ---
+    # Levels are read off the *previous* bar, so the break is measured
+    # against a level that was already known before this candle opened.
+    level_hi = prev["fractal_high"]
+    level_lo = prev["fractal_low"]
 
-    strat1_buy = ema_crossed_up and rsi_ok_buy
-    strat1_sell = ema_crossed_down and rsi_ok_sell
+    frac_buy = pd.notna(level_hi) and prev["Close"] <= level_hi and curr["Close"] > level_hi
+    frac_sell = pd.notna(level_lo) and prev["Close"] >= level_lo and curr["Close"] < level_lo
 
-    # Strategy 2: MACD line/signal crossover, histogram confirms direction
-    macd_crossed_up = prev["macd"] <= prev["macd_signal"] and curr["macd"] > curr["macd_signal"]
-    macd_crossed_down = prev["macd"] >= prev["macd_signal"] and curr["macd"] < curr["macd_signal"]
+    if not frac_buy and not frac_sell:
+        return None, 0.0, None, ""
+    if frac_buy and frac_sell:
+        # A bar straddling both levels tells us nothing directional. Not
+        # reachable with close-based triggers, but it would be if the trigger
+        # were ever switched to intrabar High/Low, so guard it here.
+        return None, 0.0, None, ""
 
-    strat2_buy = macd_crossed_up and curr["macd_hist"] > 0
-    strat2_sell = macd_crossed_down and curr["macd_hist"] < 0
+    # --- Strategy 2: EMA regime ---
+    bull = curr["ema_1"] > curr["ema_2"] > curr["ema_3"] and curr["Close"] > curr["ema_1"]
+    bear = curr["ema_1"] < curr["ema_2"] < curr["ema_3"] and curr["Close"] < curr["ema_1"]
 
-    signal = None
-    if strat1_buy and strat2_buy:
-        signal = "BUY"
-    elif strat1_sell and strat2_sell:
-        signal = "SELL"
+    if (frac_buy and bear) or (frac_sell and bull):
+        return None, 0.0, None, ""
 
-    if signal is None:
-        return None, 0.0
+    signal = "BUY" if frac_buy else "SELL"
+    level = level_hi if frac_buy else level_lo
+    side = "above" if frac_buy else "below"
 
-    # --- Strength score: how convincingly both strategies agree ---
-    # RSI component: distance from the band's edges (more central = stronger)
-    rsi_mid = (RSI_MIN + RSI_MAX) / 2
-    rsi_half_width = (RSI_MAX - RSI_MIN) / 2
-    rsi_score = _clip01(1 - abs(curr["rsi"] - rsi_mid) / rsi_half_width) if rsi_half_width else 0.5
+    # --- Strength score: how decisive the break and the regime are ---
+    atr = curr["atr"]
+    atr_ok = pd.notna(atr) and atr > 0
 
-    # MACD component: histogram size relative to its recent volatility
-    recent_hist_std = df["macd_hist"].tail(50).std()
-    macd_score = _clip01(abs(curr["macd_hist"]) / (2 * recent_hist_std)) if recent_hist_std else 0.5
+    # How far the close pushed past the broken level, in ATRs.
+    break_score = _clip01(abs(curr["Close"] - level) / atr) if atr_ok else 0.5
 
-    # EMA separation component: gap between EMAs relative to ATR (bigger = more decisive cross)
-    ema_gap = abs(curr["ema_fast"] - curr["ema_slow"])
-    ema_score = _clip01(ema_gap / (curr["atr"])) if curr["atr"] else 0.5
+    # How widely fanned the EMA stack is (a tight stack is an indecisive one).
+    stack_score = _clip01(abs(curr["ema_1"] - curr["ema_3"]) / (3 * atr)) if atr_ok else 0.5
 
-    strength = (rsi_score + macd_score + ema_score) / 3
-    return signal, strength
+    # Momentum of the fast EMA over the last 10 bars.
+    prior_ema1 = df["ema_1"].iloc[-11]
+    if atr_ok and pd.notna(prior_ema1):
+        slope_score = _clip01(abs(curr["ema_1"] - prior_ema1) / atr)
+    else:
+        slope_score = 0.5
+
+    strength = (break_score + stack_score + slope_score) / 3
+
+    if (frac_buy and bull) or (frac_sell and bear):
+        direction = "bullish" if frac_buy else "bearish"
+        reason = f"{STRAT1_NAME} break {side} {level:,.2f} + {STRAT2_NAME} {direction} stack"
+        return signal, strength, "STRONG", reason
+
+    reason = f"{STRAT1_NAME} break {side} {level:,.2f}, {STRAT2_NAME} neutral (unconfirmed)"
+    return signal, min(strength, WEAK_STRENGTH_CAP), "WEAK", reason
 
 
 def build_sl_tp(signal, price, atr, strength):
@@ -209,15 +280,14 @@ def build_sl_tp(signal, price, atr, strength):
     return sl, tp, rr
 
 
-def send_discord_alert(signal, price, rsi, atr, strength, sl, tp, rr):
+def send_discord_alert(signal, price, atr, strength, tier, reason, sl, tp, rr):
     emoji = "\U0001F7E2" if signal == "BUY" else "\U0001F534"
-    stars = "\u2B50" * max(1, round(strength * 5))
+    stars = "⭐" * max(1, round(strength * 5))
     content = (
-        f"{emoji} **{signal}** {TICKER} @ {price:,.2f}\n"
-        f"Confirmed by EMA{FAST_EMA}/{SLOW_EMA}+RSI and MACD{MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL} "
-        f"(RSI {rsi:.1f})\n"
+        f"{emoji} **{tier} {signal}** {TICKER} @ {price:,.2f}\n"
+        f"{reason}\n"
         f"Signal strength: {strength * 100:.0f}% {stars}\n"
-        f"SL: {sl:,.2f}  |  TP: {tp:,.2f}  |  R:R \u2248 1:{rr:.2f}\n"
+        f"SL: {sl:,.2f}  |  TP: {tp:,.2f}  |  R:R ≈ 1:{rr:.2f}\n"
         f"_Not financial advice — informational only, act at your own discretion._"
     )
     resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)
@@ -226,9 +296,10 @@ def send_discord_alert(signal, price, rsi, atr, strength, sl, tp, rr):
 
 def send_startup_message():
     content = (
-        f"\u2705 **Signal bot started** — watching {TICKER} on {INTERVAL} candles\n"
-        f"Strategy 1: EMA{FAST_EMA}/{SLOW_EMA} + RSI{RSI_LEN} ({RSI_MIN}-{RSI_MAX}) | "
-        f"Strategy 2: MACD {MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL} | both must agree\n"
+        f"✅ **Signal bot started** — watching {TICKER} on {INTERVAL} candles\n"
+        f"Strategy 1: Williams Fractals (n={FRACTAL_N}) breakout\n"
+        f"Strategy 2: Triple EMA {EMA_1}/{EMA_2}/{EMA_3} regime\n"
+        f"Both agree = STRONG, one = WEAK, conflict = silent\n"
         f"Polling every {POLL_SECONDS}s"
     )
     try:
@@ -247,26 +318,45 @@ def run_once():
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    df = compute_indicators(df)
-    signal, strength = detect_signal(df)
-    last_signal = load_last_signal()
+    if len(df) < MIN_BARS:
+        print(
+            f"[{TICKER}] only {len(df)} bars returned, need {MIN_BARS} to warm up EMA{EMA_3} - "
+            f"widen SIGNAL_LOOKBACK (currently {LOOKBACK}) or use a coarser SIGNAL_INTERVAL"
+        )
+        return
 
-    if signal and signal != last_signal:
+    df = compute_indicators(df)
+    signal, strength, tier, reason = detect_signal(df)
+
+    last = load_last_signal()
+    last_signal = last["signal"] if last else None
+    last_tier = last["tier"] if last else None
+
+    is_new_direction = signal is not None and signal != last_signal
+    is_upgrade = (
+        signal is not None
+        and signal == last_signal
+        and last_tier == "WEAK"
+        and tier == "STRONG"
+    )
+
+    if is_new_direction or is_upgrade:
         latest = df.iloc[-1]
         sl, tp, rr = build_sl_tp(signal, latest["Close"], latest["atr"], strength)
-        send_discord_alert(signal, latest["Close"], latest["rsi"], latest["atr"], strength, sl, tp, rr)
-        save_last_signal(signal)
-        print(f"[{TICKER}] sent {signal} alert @ {latest['Close']:.2f} (strength {strength:.2f})")
+        send_discord_alert(signal, latest["Close"], latest["atr"], strength, tier, reason, sl, tp, rr)
+        save_last_signal(signal, tier)
+        print(f"[{TICKER}] sent {tier} {signal} alert @ {latest['Close']:.2f} (strength {strength:.2f})")
     else:
-        print(f"[{TICKER}] no new confirmed signal (last sent: {last_signal})")
+        print(f"[{TICKER}] no new confirmed signal (last sent: {last_tier} {last_signal})")
 
 
 if __name__ == "__main__":
     print(
         f"Watching {TICKER} on {INTERVAL} candles | "
-        f"Strategy 1: EMA{FAST_EMA}/{SLOW_EMA} + RSI{RSI_LEN} ({RSI_MIN}-{RSI_MAX}) | "
-        f"Strategy 2: MACD {MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL} | "
-        f"both required to agree | polling every {POLL_SECONDS}s"
+        f"Strategy 1: Williams Fractals (n={FRACTAL_N}) breakout | "
+        f"Strategy 2: Triple EMA {EMA_1}/{EMA_2}/{EMA_3} regime | "
+        f"both agree = STRONG, one = WEAK, conflict = silent | "
+        f"polling every {POLL_SECONDS}s"
     )
     send_startup_message()
     while True:
