@@ -615,65 +615,181 @@ class TestBarsSince:
         assert signal_bot.bars_since(df, "2020-01-01") == 10
 
 
+class _RunOnceEnv:
+    """Captures what run_once() did, without network or Discord."""
+
+    def __init__(self, index):
+        self.index = index
+        self.sent = []
+        # The final row of the frame run_once() reads its price and EMAs from.
+        # Tests reassign this before calling run_once().
+        self.curr = dict(BUY_CURR)
+
+    def indicator_frame(self, df):
+        return make_signal_df(len(df), self.curr).set_index(df.index)
+
+
+@pytest.fixture
+def run_once_env(tmp_path, monkeypatch):
+    """Wire run_once() up against stubs, leaving its own logic intact."""
+    monkeypatch.setattr(signal_bot, "STATE_FILE", tmp_path / ".state_TEST.json")
+    monkeypatch.setattr(signal_bot, "COOLDOWN_BARS", 4)
+
+    idx = bars(signal_bot.MIN_BARS)
+    env = _RunOnceEnv(idx)
+
+    monkeypatch.setattr(
+        signal_bot, "send_discord_alert",
+        lambda *a, **k: env.sent.append((a, k)),
+    )
+    raw = pd.DataFrame(
+        {"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 112.0, "Volume": 0.0},
+        index=idx,
+    )
+    monkeypatch.setattr(signal_bot.yf, "download", lambda *a, **k: raw.copy())
+    monkeypatch.setattr(signal_bot, "drop_unclosed_bar", lambda df: df)
+    monkeypatch.setattr(signal_bot, "compute_indicators", env.indicator_frame)
+    return env
+
+
+def detect_stub(signal="BUY", tier="STRONG", depth=1):
+    return lambda df: (signal, 0.8, tier, depth, "test reason")
+
+
 class TestCooldown:
     """run_once()'s throttle: same direction inside COOLDOWN_BARS is dropped."""
 
-    @pytest.fixture(autouse=True)
-    def _wiring(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(signal_bot, "STATE_FILE", tmp_path / ".state_TEST.json")
-        monkeypatch.setattr(signal_bot, "COOLDOWN_BARS", 4)
-
-        self.sent = []
-        monkeypatch.setattr(
-            signal_bot, "send_discord_alert",
-            lambda *a, **k: self.sent.append((a, k)),
-        )
-
-        idx = bars(signal_bot.MIN_BARS)
-        frame = pd.DataFrame(
-            {
-                "Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 112.0,
-                "Volume": 0.0,
-            },
-            index=idx,
-        )
-        monkeypatch.setattr(signal_bot.yf, "download", lambda *a, **k: frame.copy())
-        monkeypatch.setattr(signal_bot, "drop_unclosed_bar", lambda df: df)
-        monkeypatch.setattr(
-            signal_bot, "compute_indicators",
-            lambda df: make_signal_df(len(df), BUY_CURR).set_index(df.index),
-        )
-        self.index = idx
-        yield
-
-    def _detect(self, signal="BUY", tier="STRONG", depth=1):
-        return lambda df: (signal, 0.8, tier, depth, "test reason")
-
-    def test_same_direction_within_cooldown_is_suppressed(self, monkeypatch):
-        monkeypatch.setattr(signal_bot, "detect_signal", self._detect())
+    def test_same_direction_within_cooldown_is_suppressed(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
         # Stored two bars ago, cooldown is 4.
-        signal_bot.save_last_signal("BUY", "STRONG", 1, str(self.index[-3]))
+        signal_bot.save_last_signal("BUY", "STRONG", 1, str(run_once_env.index[-3]))
         signal_bot.run_once()
-        assert self.sent == []
+        assert run_once_env.sent == []
 
-    def test_same_direction_after_cooldown_is_allowed(self, monkeypatch):
-        monkeypatch.setattr(signal_bot, "detect_signal", self._detect())
-        signal_bot.save_last_signal("BUY", "WEAK", 1, str(self.index[-10]))
+    def test_same_direction_after_cooldown_is_allowed(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.save_last_signal("BUY", "WEAK", 1, str(run_once_env.index[-10]))
         signal_bot.run_once()
-        assert len(self.sent) == 1
+        assert len(run_once_env.sent) == 1
 
-    def test_opposite_direction_is_never_suppressed(self, monkeypatch):
-        monkeypatch.setattr(signal_bot, "detect_signal", self._detect(signal="BUY"))
-        signal_bot.save_last_signal("SELL", "STRONG", 1, str(self.index[-2]))
+    def test_opposite_direction_is_never_suppressed(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub(signal="BUY"))
+        signal_bot.save_last_signal("SELL", "STRONG", 1, str(run_once_env.index[-2]))
         signal_bot.run_once()
-        assert len(self.sent) == 1
+        assert len(run_once_env.sent) == 1
 
-    def test_no_signal_sends_nothing(self, monkeypatch):
+    def test_no_signal_sends_nothing(self, run_once_env, monkeypatch):
         monkeypatch.setattr(
             signal_bot, "detect_signal", lambda df: (None, 0.0, None, 0, "")
         )
         signal_bot.run_once()
-        assert self.sent == []
+        assert run_once_env.sent == []
+
+
+class TestRunOnceRefusedTrades:
+    """
+    A qualifying signal is not enough on its own: if build_sl_tp refuses the
+    trade, run_once() must stay silent rather than alert with nonsense levels,
+    and must not record state for an alert it never sent.
+
+    These exercise the real build_sl_tp, not a stub -- test_premise_* pins the
+    inputs that make it refuse, so the tests cannot silently stop testing the
+    branch if those numbers drift.
+    """
+
+    # Depth-1 long: the stop references the mid EMA at 105 with a 0.25 x ATR(10)
+    # buffer, putting it at 102.5. A close of 100 sits below its own stop.
+    WRONG_SIDE = dict(BUY_CURR, Close=100.0)
+
+    def test_premise_wrong_side_inputs_really_are_refused(self):
+        assert signal_bot.build_sl_tp(
+            "BUY", price=100.0, depth=1, ema_mid=105.0, ema_slow=100.0, atr=10.0
+        ) is None
+
+    def test_premise_valid_inputs_really_are_accepted(self):
+        assert signal_bot.build_sl_tp(
+            "BUY", price=112.0, depth=1, ema_mid=105.0, ema_slow=100.0, atr=10.0
+        ) is not None
+
+    def test_no_alert_when_the_stop_lands_on_the_wrong_side_of_entry(
+        self, run_once_env, monkeypatch
+    ):
+        run_once_env.curr = self.WRONG_SIDE
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        assert run_once_env.sent == []
+
+    def test_state_is_not_written_for_an_alert_that_was_never_sent(
+        self, run_once_env, monkeypatch
+    ):
+        run_once_env.curr = self.WRONG_SIDE
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        assert signal_bot.load_last_signal() is None
+
+    def test_a_refused_trade_does_not_block_the_next_valid_one(
+        self, run_once_env, monkeypatch
+    ):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        run_once_env.curr = self.WRONG_SIDE
+        signal_bot.run_once()
+        # Price recovers above the stop on the next poll.
+        run_once_env.curr = dict(BUY_CURR)
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
+
+    def test_max_risk_ceiling_also_suppresses_the_alert(self, run_once_env, monkeypatch):
+        # Risk is 9.5 against ATR 10, so a 0.5 ATR ceiling rejects it.
+        monkeypatch.setattr(signal_bot, "MAX_RISK_ATR", 0.5)
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        assert run_once_env.sent == []
+        assert signal_bot.load_last_signal() is None
+
+    def test_a_valid_setup_still_alerts_and_records_state(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
+        assert signal_bot.load_last_signal()["signal"] == "BUY"
+
+    def test_state_is_not_recorded_when_the_discord_send_fails(
+        self, run_once_env, monkeypatch
+    ):
+        """
+        State must be written only after the alert is actually delivered.
+        Recording it first would mark a dropped alert as sent, and the next
+        poll would treat it as old news instead of retrying.
+        """
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+
+        def boom(*a, **k):
+            raise signal_bot.requests.exceptions.HTTPError("503 from Discord")
+
+        monkeypatch.setattr(signal_bot, "send_discord_alert", boom)
+
+        with pytest.raises(signal_bot.requests.exceptions.HTTPError):
+            signal_bot.run_once()
+        assert signal_bot.load_last_signal() is None
+
+    def test_the_retry_after_a_failed_send_goes_through(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+
+        def boom(*a, **k):
+            raise signal_bot.requests.exceptions.HTTPError("503 from Discord")
+
+        monkeypatch.setattr(signal_bot, "send_discord_alert", boom)
+        with pytest.raises(signal_bot.requests.exceptions.HTTPError):
+            signal_bot.run_once()
+
+        # Webhook recovers on the next poll; the signal is still unsent, so it
+        # must fire rather than being suppressed as already-seen.
+        monkeypatch.setattr(
+            signal_bot, "send_discord_alert",
+            lambda *a, **k: run_once_env.sent.append((a, k)),
+        )
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
+        assert signal_bot.load_last_signal()["signal"] == "BUY"
 
 
 # ---------------------------------------------------------------------------
