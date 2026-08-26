@@ -54,8 +54,8 @@ import requests
 import yfinance as yf
 
 # ---- Config (override via environment variables) ----
-TICKER = os.environ.get("SIGNAL_TICKER", "BTC-USD")          # Yahoo Finance ticker symbol
-INTERVAL = os.environ.get("SIGNAL_INTERVAL", "5m")           # 1m,5m,15m,1h,1d ...
+TICKER = os.environ.get("SIGNAL_TICKER", "GC=F")          # Yahoo Finance ticker symbol
+INTERVAL = os.environ.get("SIGNAL_INTERVAL", "15m")           # 1m,5m,15m,1h,1d ...
 LOOKBACK = os.environ.get("SIGNAL_LOOKBACK", "5d")           # history window to pull each poll
 
 # Strategy 1: Williams Fractals
