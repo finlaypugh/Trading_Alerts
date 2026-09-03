@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# run.sh — set up (once) and launch the BTC signal bot.
+# run.sh — set up (once) and launch the signal bot for the configured ticker.
 #
 # Usage:
 #   1. Copy .env.example to .env and fill in DISCORD_WEBHOOK_URL (and any
@@ -52,5 +52,12 @@ if [ -z "${DISCORD_WEBHOOK_URL:-}" ]; then
     exit 1
 fi
 
-echo "Starting signal bot for ${SIGNAL_TICKER:-BTC-USD}..."
+# No default. A silent fallback would run a strategy tuned for one instrument
+# against whatever the fallback happens to be.
+if [ -z "${SIGNAL_TICKER:-}" ]; then
+    echo "SIGNAL_TICKER is not set. Add it to .env before running (e.g. GC=F)."
+    exit 1
+fi
+
+echo "Starting signal bot for ${SIGNAL_TICKER}..."
 exec python signal_bot.py

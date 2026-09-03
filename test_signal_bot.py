@@ -47,10 +47,34 @@ def make_hl_df(highs, lows=None, index=None):
     )
 
 
+def make_trend_df(tail, highs=None, lows=None, base_len=250, rising=True):
+    """A long, clean trend with a hand-written tail bolted onto the end.
+
+    The base leg is a straight line, which settles the EMAs into a wide stack
+    with price well clear of the fast one; the tail is where the pullback and
+    the fractal are staged. `highs`/`lows` override individual bars' wicks,
+    keyed by index within the tail -- the only way to put a swing point on a
+    bar whose close is on the other side of an EMA.
+    """
+    base = [100.0 + i for i in range(base_len)] if rising else [1000.0 - i for i in range(base_len)]
+    closes = base + [float(c) for c in tail]
+    lo = [c - 1.0 for c in closes]
+    hi = [c + 1.0 for c in closes]
+    for i, v in (lows or {}).items():
+        lo[base_len + i] = float(v)
+    for i, v in (highs or {}).items():
+        hi[base_len + i] = float(v)
+    return pd.DataFrame(
+        {"High": hi, "Low": lo, "Close": closes}, index=bars(len(closes))
+    )
+
+
 SIGNAL_COLS = [
     "Close", "ema_fast", "ema_mid", "ema_slow", "atr",
     "green_arrow", "red_arrow",
     "long_depth", "short_depth", "long_vetoed", "short_vetoed",
+    "long_pivot_depth", "short_pivot_depth",
+    "bull_stack_bars", "bear_stack_bars",
     "session_gap",
 ]
 
@@ -62,8 +86,14 @@ SIGNAL_BASE = {
     "green_arrow": False, "red_arrow": False,
     "long_depth": 0, "short_depth": 0,
     "long_vetoed": False, "short_vetoed": False,
+    "long_pivot_depth": 0, "short_pivot_depth": 0,
+    "bull_stack_bars": 0, "bear_stack_bars": 0,
     "session_gap": False,
 }
+
+# Comfortably past any MIN_STACK_BARS a test sets, so the stack-stability gate
+# stays out of the way of tests that are about something else.
+SETTLED = 10
 
 # A clean bull stack (fast above mid above slow) and its mirror.
 BULL_STACK = {"ema_fast": 110.0, "ema_mid": 105.0, "ema_slow": 100.0}
@@ -183,6 +213,12 @@ class TestSessionGaps:
         out = signal_bot.mark_session_gaps(df)
         assert not out["session_gap"].any()
 
+    def test_does_not_mutate_input(self):
+        df = make_hl_df([10, 11, 12, 13, 14])
+        original = df.copy()
+        signal_bot.mark_session_gaps(df)
+        pd.testing.assert_frame_equal(df, original)
+
     def test_pivot_whose_window_spans_a_gap_is_cleared(self):
         # A clean up-fractal at index 4, but a weekend gap sits at index 5.
         highs = [10, 11, 12, 13, 20, 13, 12, 11, 10, 9, 8, 7]
@@ -291,6 +327,8 @@ class TestComputeIndicators:
         "ema_fast", "ema_mid", "ema_slow", "atr", "session_gap",
         "up_fractal", "down_fractal", "green_arrow", "red_arrow",
         "long_depth", "short_depth", "long_vetoed", "short_vetoed",
+        "long_pivot_depth", "short_pivot_depth",
+        "bull_stack_bars", "bear_stack_bars",
     }
 
     def test_adds_expected_columns(self):
@@ -404,8 +442,14 @@ class TestPullbackState:
 # detect_signal
 # ---------------------------------------------------------------------------
 
-BUY_CURR = dict(BULL_STACK, green_arrow=True, long_depth=1, Close=112.0)
-SELL_CURR = dict(BEAR_STACK, red_arrow=True, short_depth=2, Close=88.0)
+BUY_CURR = dict(
+    BULL_STACK, green_arrow=True, long_depth=1, long_pivot_depth=1,
+    bull_stack_bars=SETTLED, Close=112.0,
+)
+SELL_CURR = dict(
+    BEAR_STACK, red_arrow=True, short_depth=2, short_pivot_depth=2,
+    bear_stack_bars=SETTLED, Close=88.0,
+)
 
 
 class TestDetectSignal:
@@ -477,6 +521,160 @@ class TestDetectSignal:
         signal, strength, tier, depth, _ = signal_bot.detect_signal(df)
         assert (signal, tier) == ("BUY", "STRONG")
         assert 0.0 <= strength <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Pivot-in-pullback gate
+# ---------------------------------------------------------------------------
+
+# Uptrend, then a pullback that closes below the fast EMA, with the swing low
+# at the bottom of it. The green arrow lands on the final bar.
+PIVOT_INSIDE = dict(tail=[340, 336, 334, 338, 342])
+
+# Same uptrend, but the swing low is a wick two bars *before* price pulls back
+# at all: the pivot bar closes above the fast EMA. Without the gate this fires,
+# which is a reversal signal arriving ahead of the move it reverses.
+PIVOT_BEFORE = dict(tail=[346, 344, 345, 336], lows={1: 332})
+
+SHORT_PIVOT_INSIDE = dict(tail=[760, 764, 766, 762, 758], rising=False)
+SHORT_PIVOT_BEFORE = dict(tail=[754, 756, 755, 764], highs={1: 768}, rising=False)
+
+
+class TestPivotInPullback:
+    """The video's sequence is pullback first, fractal at its low."""
+
+    def test_pivot_inside_the_pullback_fires(self):
+        out = signal_bot.compute_indicators(make_trend_df(**PIVOT_INSIDE))
+        signal, _, tier, depth, _ = signal_bot.detect_signal(out)
+        assert (signal, tier, depth) == ("BUY", "STRONG", 1)
+
+    def test_pivot_formed_before_the_pullback_is_rejected(self):
+        out = signal_bot.compute_indicators(make_trend_df(**PIVOT_BEFORE))
+        assert bool(out["green_arrow"].iloc[-1])       # the trigger is there
+        assert out["long_depth"].iloc[-1] == 1         # so is the pullback
+        assert out["long_pivot_depth"].iloc[-1] == 0   # but not at the pivot
+        assert signal_bot.detect_signal(out) == (None, 0.0, None, 0, "")
+
+    def test_gate_off_restores_the_permissive_behaviour(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "REQUIRE_PIVOT_IN_PULLBACK", False)
+        out = signal_bot.compute_indicators(make_trend_df(**PIVOT_BEFORE))
+        assert signal_bot.detect_signal(out)[0] == "BUY"
+
+    def test_gate_does_not_apply_when_pullbacks_are_optional(self, monkeypatch):
+        # The WEAK path is already an acknowledged deviation; the gate has
+        # nothing to say about a setup that never claimed to have a pullback.
+        monkeypatch.setattr(signal_bot, "REQUIRE_PULLBACK", False)
+        df = make_signal_df(
+            signal_bot.MIN_BARS, dict(BUY_CURR, long_depth=0, long_pivot_depth=0)
+        )
+        signal, _, tier, depth, _ = signal_bot.detect_signal(df)
+        assert (signal, tier, depth) == ("BUY", "WEAK", 0)
+
+    def test_pivot_depth_is_not_visible_until_n_bars_after_the_pivot(self):
+        """Same lookahead guarantee the arrows have: pivot depth is shifted."""
+        out = signal_bot.compute_indicators(make_trend_df(**PIVOT_INSIDE))
+        pivot = len(out) - 1 - signal_bot.FRACTAL_N
+
+        assert bool(out["down_fractal"].iloc[pivot])
+        for i in range(pivot, pivot + signal_bot.FRACTAL_N):
+            assert out["long_pivot_depth"].iloc[i] == 0, f"leaked at bar {i}"
+        assert out["long_pivot_depth"].iloc[pivot + signal_bot.FRACTAL_N] == 1
+
+    def test_short_pivot_inside_the_pullback_fires(self):
+        out = signal_bot.compute_indicators(make_trend_df(**SHORT_PIVOT_INSIDE))
+        signal, _, tier, depth, _ = signal_bot.detect_signal(out)
+        assert (signal, tier, depth) == ("SELL", "STRONG", 1)
+
+    def test_short_pivot_formed_before_the_pullback_is_rejected(self):
+        out = signal_bot.compute_indicators(make_trend_df(**SHORT_PIVOT_BEFORE))
+        assert bool(out["red_arrow"].iloc[-1])
+        assert out["short_depth"].iloc[-1] == 1
+        assert out["short_pivot_depth"].iloc[-1] == 0
+        assert signal_bot.detect_signal(out) == (None, 0.0, None, 0, "")
+
+
+# ---------------------------------------------------------------------------
+# Stack stability ("no trade" while the MAs are crossing)
+# ---------------------------------------------------------------------------
+
+class TestStackStability:
+    FAST, MID, SLOW = 105.0, 100.0, 95.0
+
+    def test_signal_suppressed_while_the_stack_is_still_fresh(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "MIN_STACK_BARS", 3)
+        df = make_signal_df(signal_bot.MIN_BARS, dict(BUY_CURR, bull_stack_bars=2))
+        assert signal_bot.detect_signal(df) == (None, 0.0, None, 0, "")
+
+    def test_exactly_min_stack_bars_is_enough(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "MIN_STACK_BARS", 3)
+        df = make_signal_df(signal_bot.MIN_BARS, dict(BUY_CURR, bull_stack_bars=3))
+        assert signal_bot.detect_signal(df)[0] == "BUY"
+
+    def test_short_side_is_gated_too(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "MIN_STACK_BARS", 3)
+        df = make_signal_df(signal_bot.MIN_BARS, dict(SELL_CURR, bear_stack_bars=2))
+        assert signal_bot.detect_signal(df) == (None, 0.0, None, 0, "")
+
+    def test_min_stack_bars_of_one_reproduces_the_old_behaviour(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "MIN_STACK_BARS", 1)
+        df = make_signal_df(signal_bot.MIN_BARS, dict(BUY_CURR, bull_stack_bars=1))
+        assert signal_bot.detect_signal(df)[0] == "BUY"
+
+    def test_counter_increments_while_the_stack_holds(self):
+        df = make_pullback_df([110, 110, 110], self.FAST, self.MID, self.SLOW)
+        out = signal_bot.compute_pullback_state(df)
+        assert list(out["bull_stack_bars"]) == [1, 2, 3]
+
+    def test_counter_resets_on_a_session_gap(self):
+        df = make_pullback_df(
+            [110, 110, 110, 110], self.FAST, self.MID, self.SLOW,
+            gaps=[False, False, True, False],
+        )
+        out = signal_bot.compute_pullback_state(df)
+        assert list(out["bull_stack_bars"]) == [1, 2, 0, 1]
+
+    def test_counter_resets_when_the_stack_inverts(self):
+        df = make_pullback_df(
+            [110, 110, 90, 90],
+            fast=[105, 105, 90, 90], mid=[100, 100, 95, 95], slow=[95, 95, 100, 100],
+        )
+        out = signal_bot.compute_pullback_state(df)
+        assert list(out["bull_stack_bars"]) == [1, 2, 0, 0]
+        assert list(out["bear_stack_bars"]) == [0, 0, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Short-side depth cap
+# ---------------------------------------------------------------------------
+
+class TestShortDepthCap:
+    def test_depth_two_short_is_suppressed_when_capped_at_one(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "SHORT_MAX_DEPTH", 1)
+        df = make_signal_df(signal_bot.MIN_BARS, SELL_CURR)
+        assert signal_bot.detect_signal(df) == (None, 0.0, None, 0, "")
+
+    def test_depth_one_short_still_fires_when_capped_at_one(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "SHORT_MAX_DEPTH", 1)
+        df = make_signal_df(
+            signal_bot.MIN_BARS,
+            dict(SELL_CURR, short_depth=1, short_pivot_depth=1),
+        )
+        assert signal_bot.detect_signal(df)[0] == "SELL"
+
+    def test_the_cap_does_not_touch_the_long_side(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "SHORT_MAX_DEPTH", 1)
+        df = make_signal_df(
+            signal_bot.MIN_BARS,
+            dict(BUY_CURR, long_depth=2, long_pivot_depth=2),
+        )
+        signal, _, _, depth, _ = signal_bot.detect_signal(df)
+        assert (signal, depth) == ("BUY", 2)
+
+    def test_default_of_two_mirrors_the_long_side(self):
+        assert signal_bot.SHORT_MAX_DEPTH == 2
+        df = make_signal_df(signal_bot.MIN_BARS, SELL_CURR)
+        signal, _, _, depth, _ = signal_bot.detect_signal(df)
+        assert (signal, depth) == ("SELL", 2)
 
 
 # ---------------------------------------------------------------------------

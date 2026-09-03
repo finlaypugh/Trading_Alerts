@@ -5,13 +5,18 @@ Standalone trading signal bot — fractal pullback entries in a stacked EMA tren
 This is one setup, not two strategies voting. A triple-EMA stack supplies the
 trend filter; a Williams Fractal supplies the timing trigger. Both are required.
 
-  Long:   ema_fast > ema_mid > ema_slow, price has pulled back to close below
-          the fast (depth 1) or mid (depth 2) EMA, a green arrow (swing low)
-          then confirms, and price has not closed below the slow EMA at any
-          point during the episode.
+  Long:   ema_fast > ema_mid > ema_slow and has been for MIN_STACK_BARS
+          closed bars, price has pulled back to close below the fast (depth 1)
+          or mid (depth 2) EMA, a green arrow (swing low) whose pivot sits
+          inside that pullback then confirms, and price has not closed below
+          the slow EMA at any point during the episode.
 
   Short:  the exact mirror — inverted stack, a close above the fast or mid
           EMA, a red arrow (swing high), no close above the slow EMA.
+
+Anything else is the third state the source names explicitly: no trade. A
+stack that has only just uncrossed is disorderly, not aligned, and a fractal
+that formed before its pullback began is not the reversal of that pullback.
 
 Arrow convention: green marks a swing LOW (a down fractal) and is the long
 trigger; red marks a swing HIGH (an up fractal) and is the short trigger.
@@ -74,6 +79,21 @@ FRACTAL_MAX_PLATEAU = int(os.environ.get("SIGNAL_FRACTAL_MAX_PLATEAU", 4))
 # Pullback episode handling
 PULLBACK_EXPIRY_BARS = int(os.environ.get("SIGNAL_PULLBACK_EXPIRY_BARS", 3))
 REQUIRE_PULLBACK = os.environ.get("SIGNAL_REQUIRE_PULLBACK", "true").lower() == "true"
+
+# The fractal has to sit inside the pullback it is supposed to be reversing.
+# Without this a pivot that formed before the pullback even started still
+# fires, as long as a pullback happens within the next n bars.
+REQUIRE_PIVOT_IN_PULLBACK = (
+    os.environ.get("SIGNAL_REQUIRE_PIVOT_IN_PULLBACK", "true").lower() == "true"
+)
+
+# The "no trade" state: MAs crossing or disorderly. A stack is only ordered
+# once it has *stayed* ordered, so require this many consecutive closed bars.
+MIN_STACK_BARS = int(os.environ.get("SIGNAL_MIN_STACK_BARS", 3))
+
+# 2 mirrors the long side. 1 restricts shorts to the single pullback-above-fast
+# entry the source material actually describes.
+SHORT_MAX_DEPTH = int(os.environ.get("SIGNAL_SHORT_MAX_DEPTH", 2))
 
 # Risk
 RR = float(os.environ.get("SIGNAL_RR", 1.5))
@@ -218,6 +238,7 @@ def mark_session_gaps(df):
     a fractal spanning one is not a real pivot and a pullback episode
     should not survive it.
     """
+    df = df.copy()
     if not isinstance(df.index, pd.DatetimeIndex) or len(df) == 0:
         df["session_gap"] = False
         return df
@@ -274,12 +295,15 @@ def _clear_pivots_spanning_gaps(pivots, session_gap, n):
 
 def compute_pullback_state(df):
     """
-    Adds long_depth / short_depth (0/1/2) and long_vetoed / short_vetoed.
+    Adds long_depth / short_depth (0/1/2), long_vetoed / short_vetoed and
+    bull_stack_bars / bear_stack_bars.
 
       depth 0 = no qualifying pullback yet
       depth 1 = closed beyond the fast EMA
       depth 2 = closed beyond the mid EMA (deeper pullback -> wider stop)
       vetoed  = closed beyond the slow EMA this episode, so the setup is dead
+      stack_bars = consecutive closed bars the stack has held its order for,
+                   reset by a cross or a session break
 
     Written as an explicit bar-by-bar pass. Clarity beats vectorisation here,
     and a few hundred rows per poll costs nothing.
@@ -298,10 +322,13 @@ def compute_pullback_state(df):
     short_depth = [0] * n
     long_vetoed = [False] * n
     short_vetoed = [False] * n
+    bull_stack_bars = [0] * n
+    bear_stack_bars = [0] * n
 
     l_depth = s_depth = 0
     l_veto = s_veto = False
     l_bars_back = s_bars_back = 0
+    l_stack_bars = s_stack_bars = 0
 
     for i in range(n):
         if gap[i]:
@@ -312,6 +339,12 @@ def compute_pullback_state(df):
         separated = _stack_open(fast[i], slow[i], atr[i])
         bull = fast[i] > mid[i] > slow[i] and separated
         bear = fast[i] < mid[i] < slow[i] and separated
+
+        # How long the stack has held this order. `bull` is already true on the
+        # very first bar after an uncross, which is the disorderly state the
+        # setup is meant to sit out; a session break severs the run outright.
+        l_stack_bars = l_stack_bars + 1 if bull and not gap[i] else 0
+        s_stack_bars = s_stack_bars + 1 if bear and not gap[i] else 0
 
         # --- long side ---
         if not bull:
@@ -359,11 +392,15 @@ def compute_pullback_state(df):
         short_depth[i] = s_depth
         long_vetoed[i] = l_veto
         short_vetoed[i] = s_veto
+        bull_stack_bars[i] = l_stack_bars
+        bear_stack_bars[i] = s_stack_bars
 
     df["long_depth"] = long_depth
     df["short_depth"] = short_depth
     df["long_vetoed"] = long_vetoed
     df["short_vetoed"] = short_vetoed
+    df["bull_stack_bars"] = bull_stack_bars
+    df["bear_stack_bars"] = bear_stack_bars
     return df
 
 
@@ -391,6 +428,12 @@ def compute_indicators(df):
     # window straddles one is an artefact of the gap rather than a real swing.
     df = mark_session_gaps(df)
 
+    # --- Pullback episodes ---
+    # Computed before the fractals because a pivot has to be scored against the
+    # pullback state that existed at the pivot bar itself. Depends only on
+    # Close, the EMAs, ATR and session_gap, all of which are already here.
+    df = compute_pullback_state(df)
+
     # --- Trigger: Williams fractals ---
     up_pivot = _fractal_mask(df["High"], FRACTAL_N, FRACTAL_MAX_PLATEAU, up=True)
     down_pivot = _fractal_mask(df["Low"], FRACTAL_N, FRACTAL_MAX_PLATEAU, up=False)
@@ -411,8 +454,15 @@ def compute_indicators(df):
     df["green_arrow"] = down_pivot.shift(FRACTAL_N).fillna(False).astype(bool)
     df["red_arrow"] = up_pivot.shift(FRACTAL_N).fillna(False).astype(bool)
 
-    # --- Pullback episodes ---
-    df = compute_pullback_state(df)
+    # The pullback depth that was live at the *pivot* bar, carried to the
+    # confirmation bar by the same shift the arrows use, so no lookahead is
+    # introduced. Zero means the fractal formed outside a pullback.
+    df["long_pivot_depth"] = (
+        df["long_depth"].where(down_pivot, 0).shift(FRACTAL_N).fillna(0).astype(int)
+    )
+    df["short_pivot_depth"] = (
+        df["short_depth"].where(up_pivot, 0).shift(FRACTAL_N).fillna(0).astype(int)
+    )
 
     return df
 
@@ -431,8 +481,13 @@ def detect_signal(df):
     bull = curr["ema_fast"] > curr["ema_mid"] > curr["ema_slow"] and separated
     bear = curr["ema_fast"] < curr["ema_mid"] < curr["ema_slow"] and separated
 
-    long_ok = bool(curr["green_arrow"]) and bull and not bool(curr["long_vetoed"])
-    short_ok = bool(curr["red_arrow"]) and bear and not bool(curr["short_vetoed"])
+    # A stack that only just uncrossed is the source's third state -- no trade
+    # -- so alignment has to have survived MIN_STACK_BARS closed bars.
+    bull_settled = bull and int(curr["bull_stack_bars"]) >= MIN_STACK_BARS
+    bear_settled = bear and int(curr["bear_stack_bars"]) >= MIN_STACK_BARS
+
+    long_ok = bool(curr["green_arrow"]) and bull_settled and not bool(curr["long_vetoed"])
+    short_ok = bool(curr["red_arrow"]) and bear_settled and not bool(curr["short_vetoed"])
 
     if long_ok and short_ok:
         # The stack cannot be both bull and bear, so this is a bug if it fires.
@@ -447,6 +502,22 @@ def detect_signal(df):
     if depth == 0 and REQUIRE_PULLBACK:
         # Trend continuation with no pullback. Not part of the setup.
         return None, 0.0, None, 0, ""
+
+    if short_ok and depth > SHORT_MAX_DEPTH:
+        # Mirroring the long side gives shorts a second, deeper entry the
+        # source never describes. SHORT_MAX_DEPTH=1 declines it.
+        return None, 0.0, None, 0, ""
+
+    if REQUIRE_PULLBACK and REQUIRE_PIVOT_IN_PULLBACK:
+        # The sequence is pullback first, fractal at its low. A pivot that
+        # formed before the pullback began is a reversal signal arriving ahead
+        # of the move it claims to reverse. Skipped when pullbacks are optional,
+        # since that path is already an acknowledged deviation.
+        pivot_depth = int(
+            curr["long_pivot_depth"] if long_ok else curr["short_pivot_depth"]
+        )
+        if pivot_depth == 0:
+            return None, 0.0, None, 0, ""
 
     # --- Strength score ---
     atr = curr["atr"]
