@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Backtest the live signal rules against historical bars.
+Backtest the live signal rules against historical OANDA candles.
 
-The strategy this bot implements was demonstrated on a different market and a
-different timeframe, so nothing here is validated until this script has run.
-At RR 1.5 the breakeven win rate is 40% before costs; that is the number the
-output should be read against.
+The strategy this bot implements was demonstrated on 1-minute charts, so that
+is the default granularity here, whatever SIGNAL_INTERVAL the live bot polls
+at. Nothing is validated until this script has run. At RR 1.5 the breakeven
+win rate is 40% before costs; that is the number the output should be read
+against.
 
 The rules are *imported*, never reimplemented — compute_indicators,
 detect_signal and build_sl_tp are the same functions the live bot calls. A
@@ -17,14 +18,18 @@ the fractal arrows are shifted forward by FRACTAL_N precisely so a pivot is
 not readable until the bar that first makes it knowable. detect_signal is
 handed a slice ending at the bar being evaluated, exactly as it is live.
 
+Data comes from OANDA's v3 candles endpoint (mid prices), not yfinance: Yahoo
+serves no spot gold and caps intraday history. Needs OANDA_API_TOKEN; a free
+practice account is enough.
+
 Usage:
-    python backtest.py                      # SIGNAL_TICKER from .env, 60 days
-    python backtest.py --ticker GC=F --days 60
+    python backtest.py                      # XAU_USD, M1, 60 days
+    python backtest.py --instrument XAU_USD --granularity M1 --days 14
     python backtest.py --baseline           # Phase 1 gates off, for comparison
 
 Entries fill at the close of the confirmation bar. One position at a time.
 When a single bar's range covers both the stop and the target, it counts as a
-loss — a 15m bar cannot say which came first, and the optimistic reading is
+loss — one bar cannot say which came first, and the optimistic reading is
 how backtests flatter themselves.
 """
 
@@ -33,12 +38,31 @@ import os
 import sys
 
 import pandas as pd
+import requests
+
+# OANDA granularity -> the interval string signal_bot parses for
+# interval_minutes / mark_session_gaps. Sub-minute granularities are left out
+# because that parser cannot express them.
+GRANULARITY_TO_INTERVAL = {
+    "M1": "1m", "M5": "5m", "M15": "15m", "M30": "30m",
+    "H1": "1h", "H4": "4h", "D": "1d",
+}
+
+OANDA_HOSTS = {
+    "practice": "https://api-fxpractice.oanda.com",
+    "live": "https://api-fxtrade.oanda.com",
+}
+
+# OANDA's ceiling on candles per request.
+PAGE_SIZE = 5000
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    p.add_argument("--ticker", default=None, help="Yahoo symbol (default: SIGNAL_TICKER)")
-    p.add_argument("--interval", default=None, help="bar size (default: SIGNAL_INTERVAL)")
+    p.add_argument("--instrument", default="XAU_USD",
+                   help="OANDA instrument (default: XAU_USD, spot gold)")
+    p.add_argument("--granularity", default="M1", choices=list(GRANULARITY_TO_INTERVAL),
+                   help="OANDA candle granularity (default: M1)")
     p.add_argument("--days", type=int, default=60, help="days of history to pull")
     p.add_argument(
         "--baseline", action="store_true",
@@ -51,46 +75,81 @@ def parse_args(argv=None):
 
 ARGS = parse_args()
 
-# signal_bot reads both of these at import time. The webhook is never used
-# here: nothing in this script sends anything.
+# signal_bot reads all of these at import time. The webhook is never used
+# here: nothing in this script sends anything. SIGNAL_INTERVAL is overwritten
+# unconditionally — the live bot's 15m polling interval in .env must not
+# become the backtest's bar size.
 os.environ.setdefault("DISCORD_WEBHOOK_URL", "https://example.invalid/backtest-only")
-if ARGS.ticker:
-    os.environ["SIGNAL_TICKER"] = ARGS.ticker
-if ARGS.interval:
-    os.environ["SIGNAL_INTERVAL"] = ARGS.interval
+os.environ["SIGNAL_TICKER"] = ARGS.instrument
+os.environ["SIGNAL_INTERVAL"] = GRANULARITY_TO_INTERVAL[ARGS.granularity]
 
 import signal_bot  # noqa: E402  (must follow the env setup above)
 
 
-def fetch_history(ticker, interval, days):
-    """
-    Yahoo caps a single intraday request at 60 days, so pull in 60-day pages
-    and concatenate. It also refuses intraday bars older than its own
-    retention window, so asking for more than it keeps returns less than
-    requested rather than failing — the printed bar count is the truth.
-    """
-    end = pd.Timestamp.now(tz="UTC").normalize() + pd.Timedelta(days=1)
-    frames = []
-    remaining = days
-    while remaining > 0:
-        span = min(60, remaining)
-        start = end - pd.Timedelta(days=span)
-        page = signal_bot.yf.download(
-            ticker, start=start.date(), end=end.date(),
-            interval=interval, progress=False, auto_adjust=False,
-        )
-        if page is None or page.empty:
-            break
-        if isinstance(page.columns, pd.MultiIndex):
-            page.columns = page.columns.get_level_values(0)
-        frames.append(page)
-        end = start
-        remaining -= span
+def _to_utc(value):
+    """Any timestamp-like -> tz-aware UTC Timestamp, naive input read as UTC."""
+    ts = pd.Timestamp(value)
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
-    if not frames:
+
+def _oanda_time(ts):
+    return ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def fetch_history(instrument, granularity, days, environment, token=None, end=None):
+    """
+    Pull mid-price candles for [end - days, end] from OANDA, closed bars only.
+
+    The candles endpoint rejects `count` sent together with both `from` and
+    `to`, so every page is `from` + `count` and the cursor walks forward from
+    the last candle received. The final page usually runs past `end`; that
+    overshoot is trimmed after the fact.
+
+    Returns an empty frame, not an error, when OANDA has nothing for the
+    window. HTTP failures (bad token, unknown instrument) raise.
+    """
+    token = token or os.environ.get("OANDA_API_TOKEN", "")
+    end = _to_utc(pd.Timestamp.now(tz="UTC") if end is None else end)
+    start = end - pd.Timedelta(days=days)
+
+    url = f"{OANDA_HOSTS[environment]}/v3/instruments/{instrument}/candles"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    rows = []
+    cursor = start
+    while True:
+        resp = requests.get(
+            url, headers=headers, timeout=30,
+            params={"granularity": granularity, "price": "M",
+                    "from": _oanda_time(cursor), "count": PAGE_SIZE},
+        )
+        resp.raise_for_status()
+        candles = resp.json().get("candles", [])
+        if not candles:
+            break
+        for c in candles:
+            mid = c["mid"]
+            rows.append({
+                "time": c["time"], "complete": c["complete"],
+                "Open": float(mid["o"]), "High": float(mid["h"]),
+                "Low": float(mid["l"]), "Close": float(mid["c"]),
+                "Volume": int(c["volume"]),
+            })
+        last = _to_utc(candles[-1]["time"])
+        if last >= end or len(candles) < PAGE_SIZE:
+            break
+        cursor = last + pd.Timedelta(microseconds=1)
+
+    if not rows:
         return pd.DataFrame()
-    df = pd.concat(frames).sort_index()
-    return df[~df.index.duplicated(keep="first")]
+
+    df = pd.DataFrame(rows)
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df[df["complete"].astype(bool)]
+    df = df.drop_duplicates(subset="time").sort_values("time")
+    df = df.set_index("time").drop(columns="complete")
+    df.index.name = None
+    return df[df.index <= end]
 
 
 def resolve(highs, lows, entry_i, signal, sl, tp):
@@ -261,12 +320,23 @@ def main():
         signal_bot.REQUIRE_PIVOT_IN_PULLBACK = False
         signal_bot.MIN_STACK_BARS = 1
 
-    if not signal_bot.TICKER:
-        print("SIGNAL_TICKER is not set. Pass --ticker or set it in .env.",
-              file=sys.stderr)
+    token = os.environ.get("OANDA_API_TOKEN", "")
+    if not token:
+        print("OANDA_API_TOKEN is not set. Generate one under Manage API Access "
+              "in your OANDA account and export it.", file=sys.stderr)
+        return 2
+    environment = os.environ.get("OANDA_ENVIRONMENT", "practice")
+    if environment not in OANDA_HOSTS:
+        print(f"OANDA_ENVIRONMENT must be one of {sorted(OANDA_HOSTS)}, "
+              f"got {environment!r}.", file=sys.stderr)
         return 2
 
-    df = fetch_history(signal_bot.TICKER, signal_bot.INTERVAL, args.days)
+    try:
+        df = fetch_history(args.instrument, args.granularity, args.days,
+                           environment, token=token)
+    except requests.HTTPError as exc:
+        print(f"OANDA request failed: {exc}\n{exc.response.text}", file=sys.stderr)
+        return 1
     if df.empty:
         print(f"No data returned for {signal_bot.TICKER}.", file=sys.stderr)
         return 1

@@ -96,21 +96,35 @@ Read these before trusting an alert.
 
 ## Validation
 
-`backtest.py` replays the live rules over historical bars. It imports
+`backtest.py` replays the live rules over historical OANDA candles. It imports
 `compute_indicators`, `detect_signal` and `build_sl_tp` rather than
 reimplementing them — a backtest that disagrees with the bot is worse than no
 backtest.
 
+It needs an OANDA API token (practice account is fine: *Manage API Access →
+Generate Personal Access Token*). The live bot does not use it.
+
 ```bash
-python backtest.py --ticker 'GC=F' --days 60
-python backtest.py --ticker 'GC=F' --days 60 --baseline   # gates off
+export OANDA_API_TOKEN=...                 # OANDA_ENVIRONMENT=practice|live, default practice
+python backtest.py                         # XAU_USD, M1, 60 days
+python backtest.py --days 14 --baseline    # gates off, for comparison
+python backtest.py --granularity M15 --csv trades.csv
 ```
+
+| Flag | Default | |
+|---|---|---|
+| `--instrument` | `XAU_USD` | OANDA instrument. Spot gold; `GC=F` has no OANDA equivalent. |
+| `--granularity` | `M1` | `M1` `M5` `M15` `M30` `H1` `H4` `D`. Ignores `SIGNAL_INTERVAL`. |
+| `--days` | `60` | History ending now. |
+| `--baseline` | off | Pivot-in-pullback and stack-stability gates off. |
+| `--csv` | — | Write the trade list to this path. |
 
 Entries fill at the close of the confirmation bar, one position at a time,
 honouring `SIGNAL_COOLDOWN_BARS`. When one bar's range covers both the stop
-and the target it is scored as a loss — a 15m bar cannot say which came first.
+and the target it is scored as a loss — one bar cannot say which came first.
 
-**Result, `GC=F` 15m, 3,993 bars (2026-07-06 to 2026-09-03):**
+**Result, `GC=F` 15m via yfinance, 3,993 bars (2026-07-06 to 2026-09-03),
+before the switch to OANDA:**
 
 | | trades | win rate | expectancy |
 |---|---|---|---|
@@ -168,6 +182,8 @@ is the annotated copy; this table is the complete list.
 | `SIGNAL_COOLDOWN_BARS` | `4` | Minimum bars between same-direction alerts. |
 | `SIGNAL_WEAK_STRENGTH_CAP` | `0.5` | Ceiling on a WEAK alert's strength score. |
 | `SIGNAL_POLL_SECONDS` | `300` | Seconds between polls. |
+| `OANDA_API_TOKEN` | — | **Required** by `backtest.py` only. |
+| `OANDA_ENVIRONMENT` | `practice` | `practice` or `live`. `backtest.py` only. |
 
 Alerts are throttled by state in `.state_<ticker>.json`: a repeat of the same
 direction and tier is suppressed, a WEAK→STRONG upgrade is not, and the
