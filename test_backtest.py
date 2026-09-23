@@ -1,5 +1,7 @@
 """
-Unit tests for backtest.py's OANDA fetch layer.
+Unit tests for the OANDA fetch (signal_bot.fetch_candles, driven through
+backtest.fetch_history's days-ending-at-end window) and backtest's granularity
+handling.
 
 Run locally:
     pip install pytest pandas numpy
@@ -76,14 +78,12 @@ class FakeOanda:
 class FakeResponse:
     def __init__(self, status, body):
         self.status_code = status
+        self.ok = status < 400
         self._body = body
+        self.text = str(body)
 
     def json(self):
         return self._body
-
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise backtest.requests.HTTPError(f"{self.status_code}", response=self)
 
 
 @pytest.fixture
@@ -91,9 +91,9 @@ def oanda(monkeypatch):
     """Install a FakeOanda; call the returned factory with (n, overlap)."""
     def install(n, overlap=False, page_size=None):
         fake = FakeOanda(n, overlap)
-        monkeypatch.setattr(backtest.requests, "get", fake.get)
+        monkeypatch.setattr(signal_bot.requests, "get", fake.get)
         if page_size is not None:
-            monkeypatch.setattr(backtest, "PAGE_SIZE", page_size)
+            monkeypatch.setattr(signal_bot, "OANDA_PAGE_SIZE", page_size)
         return fake
     return install
 
@@ -166,22 +166,26 @@ class TestFetchHistory:
         df = fetch(end=end)
         assert df.index.max() == T0 + pd.Timedelta(minutes=40)
 
-    def test_http_error_raises(self, monkeypatch):
+    def test_http_error_raises_with_oandas_message(self, monkeypatch):
         monkeypatch.setattr(
-            backtest.requests, "get",
+            signal_bot.requests, "get",
             lambda *a, **k: FakeResponse(401, {"errorMessage": "bad token"}),
         )
-        with pytest.raises(backtest.requests.HTTPError):
+        with pytest.raises(signal_bot.requests.HTTPError, match="bad token"):
             fetch(end=T0)
+
+    def test_unknown_environment_is_rejected(self):
+        with pytest.raises(ValueError, match="OANDA_ENVIRONMENT"):
+            backtest.fetch_history("XAU_USD", "M1", 1, "demo", token="t", end=T0)
 
 
 class TestToUtc:
     def test_aware_timestamp_is_converted_not_rejected(self):
-        ts = backtest._to_utc(pd.Timestamp("2026-09-01 12:00", tz="America/New_York"))
+        ts = signal_bot.to_utc(pd.Timestamp("2026-09-01 12:00", tz="America/New_York"))
         assert ts == pd.Timestamp("2026-09-01 16:00", tz="UTC")
 
     def test_naive_timestamp_is_read_as_utc(self):
-        ts = backtest._to_utc(pd.Timestamp("2026-09-01 12:00"))
+        ts = signal_bot.to_utc(pd.Timestamp("2026-09-01 12:00"))
         assert ts == pd.Timestamp("2026-09-01 12:00", tz="UTC")
 
 
@@ -190,9 +194,11 @@ class TestToUtc:
 # ---------------------------------------------------------------------------
 
 class TestGranularity:
-    def test_every_granularity_maps_to_a_parseable_interval(self):
+    def test_backtest_and_live_bot_agree_on_every_granularity(self):
+        # backtest maps granularity -> interval before signal_bot is imported;
+        # the live bot maps interval -> granularity. They must round-trip.
         for gran, interval in backtest.GRANULARITY_TO_INTERVAL.items():
-            assert signal_bot.interval_minutes(interval) > 0, gran
+            assert signal_bot.oanda_granularity(interval) == gran
 
     def test_default_is_one_minute_even_with_a_15m_env(self):
         # The requirement this backtest exists for: .env's SIGNAL_INTERVAL is

@@ -18,9 +18,9 @@ the fractal arrows are shifted forward by FRACTAL_N precisely so a pivot is
 not readable until the bar that first makes it knowable. detect_signal is
 handed a slice ending at the bar being evaluated, exactly as it is live.
 
-Data comes from OANDA's v3 candles endpoint (mid prices), not yfinance: Yahoo
-serves no spot gold and caps intraday history. Needs OANDA_API_TOKEN; a free
-practice account is enough.
+Candles come from OANDA (mid prices) through signal_bot.fetch_candles, the
+same fetch the live bot polls with. Needs OANDA_API_TOKEN; a free practice
+account is enough.
 
 Usage:
     python backtest.py                      # XAU_USD, M1, 60 days
@@ -47,14 +47,6 @@ GRANULARITY_TO_INTERVAL = {
     "M1": "1m", "M5": "5m", "M15": "15m", "M30": "30m",
     "H1": "1h", "H4": "4h", "D": "1d",
 }
-
-OANDA_HOSTS = {
-    "practice": "https://api-fxpractice.oanda.com",
-    "live": "https://api-fxtrade.oanda.com",
-}
-
-# OANDA's ceiling on candles per request.
-PAGE_SIZE = 5000
 
 
 def parse_args(argv=None):
@@ -86,70 +78,16 @@ os.environ["SIGNAL_INTERVAL"] = GRANULARITY_TO_INTERVAL[ARGS.granularity]
 import signal_bot  # noqa: E402  (must follow the env setup above)
 
 
-def _to_utc(value):
-    """Any timestamp-like -> tz-aware UTC Timestamp, naive input read as UTC."""
-    ts = pd.Timestamp(value)
-    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
-
-
-def _oanda_time(ts):
-    return ts.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-
 def fetch_history(instrument, granularity, days, environment, token=None, end=None):
     """
-    Pull mid-price candles for [end - days, end] from OANDA, closed bars only.
-
-    The candles endpoint rejects `count` sent together with both `from` and
-    `to`, so every page is `from` + `count` and the cursor walks forward from
-    the last candle received. The final page usually runs past `end`; that
-    overshoot is trimmed after the fact.
-
-    Returns an empty frame, not an error, when OANDA has nothing for the
-    window. HTTP failures (bad token, unknown instrument) raise.
+    `days` of closed candles ending at `end` (default now), via the same
+    fetch_candles the live bot polls with, so the two cannot drift apart.
     """
-    token = token or os.environ.get("OANDA_API_TOKEN", "")
-    end = _to_utc(pd.Timestamp.now(tz="UTC") if end is None else end)
-    start = end - pd.Timedelta(days=days)
-
-    url = f"{OANDA_HOSTS[environment]}/v3/instruments/{instrument}/candles"
-    headers = {"Authorization": f"Bearer {token}"}
-
-    rows = []
-    cursor = start
-    while True:
-        resp = requests.get(
-            url, headers=headers, timeout=30,
-            params={"granularity": granularity, "price": "M",
-                    "from": _oanda_time(cursor), "count": PAGE_SIZE},
-        )
-        resp.raise_for_status()
-        candles = resp.json().get("candles", [])
-        if not candles:
-            break
-        for c in candles:
-            mid = c["mid"]
-            rows.append({
-                "time": c["time"], "complete": c["complete"],
-                "Open": float(mid["o"]), "High": float(mid["h"]),
-                "Low": float(mid["l"]), "Close": float(mid["c"]),
-                "Volume": int(c["volume"]),
-            })
-        last = _to_utc(candles[-1]["time"])
-        if last >= end or len(candles) < PAGE_SIZE:
-            break
-        cursor = last + pd.Timedelta(microseconds=1)
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    df["time"] = pd.to_datetime(df["time"], utc=True)
-    df = df[df["complete"].astype(bool)]
-    df = df.drop_duplicates(subset="time").sort_values("time")
-    df = df.set_index("time").drop(columns="complete")
-    df.index.name = None
-    return df[df.index <= end]
+    end = signal_bot.to_utc(pd.Timestamp.now(tz="UTC") if end is None else end)
+    return signal_bot.fetch_candles(
+        instrument, granularity, end - pd.Timedelta(days=days), end,
+        token=token, environment=environment,
+    )
 
 
 def resolve(highs, lows, entry_i, signal, sl, tp):
@@ -326,8 +264,8 @@ def main():
               "in your OANDA account and export it.", file=sys.stderr)
         return 2
     environment = os.environ.get("OANDA_ENVIRONMENT", "practice")
-    if environment not in OANDA_HOSTS:
-        print(f"OANDA_ENVIRONMENT must be one of {sorted(OANDA_HOSTS)}, "
+    if environment not in signal_bot.OANDA_HOSTS:
+        print(f"OANDA_ENVIRONMENT must be one of {sorted(signal_bot.OANDA_HOSTS)}, "
               f"got {environment!r}.", file=sys.stderr)
         return 2
 

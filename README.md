@@ -1,16 +1,18 @@
 # Trading_Alerts
 
-A notification bot. It watches one Yahoo Finance symbol, looks for a single
+A notification bot. It polls one OANDA instrument, looks for a single
 setup — a Williams Fractal reversal inside a pullback within a stacked
 triple-EMA trend — and posts a Discord message when it finds one.
-**It never places a trade.** There is no broker integration, no order code and
-no key with trading permissions anywhere in this repo. Every alert is a
-suggestion for you to act on by hand, or ignore.
+**It never places a trade.** There is no order code in this repo: the only
+OANDA endpoint it calls is the read-only candles one. OANDA API tokens are not
+read-only, though, so use a **practice account** token — same candles, no real
+money behind it. Every alert is a suggestion for you to act on by hand, or
+ignore.
 
 ## Setup
 
 ```bash
-cp .env.example .env      # then fill in DISCORD_WEBHOOK_URL and SIGNAL_TICKER
+cp .env.example .env      # then fill in DISCORD_WEBHOOK_URL, OANDA_API_TOKEN, SIGNAL_TICKER
 ./run.sh                  # macOS / Linux
 run.bat                   # Windows
 ```
@@ -18,7 +20,7 @@ run.bat                   # Windows
 Both launchers create a virtualenv, install `requirements.txt`, load `.env`
 and start the bot. Neither has a default ticker: an unset `SIGNAL_TICKER` is
 an error, because a silent fallback would run a gold-tuned strategy against
-whatever the fallback happened to be.
+whatever the fallback happened to be. An unset `OANDA_API_TOKEN` is too.
 
 To keep it running across reboots, use PM2:
 
@@ -59,7 +61,7 @@ colours read backwards. `test_green_arrow_maps_to_the_swing_low` pins it.
 Read these before trusting an alert.
 
 - **Timeframe and instrument.** The source demonstrates this on 1-minute
-  charts. This bot ships configured for `GC=F` (COMEX gold futures) on 15m
+  charts. This bot ships configured for `XAU_USD` (spot gold, OANDA) on 15m
   bars. That is a different market structure, and the parameters were not
   re-tuned for it. See [Validation](#validation) for what that costs.
 - **The two-bar confirmation lag.** A fractal at bar *p* is only knowable at
@@ -81,7 +83,7 @@ Read these before trusting an alert.
   the stack to have held its order for three closed bars;
   `SIGNAL_MIN_STACK_SEP_ATR` (off by default) is the separate knob for a fan
   that is ordered but too tight.
-- **Session gaps.** Gold has a daily settlement break and weekends. Pivots
+- **Session gaps.** Gold has a daily break and weekends. Pivots
   whose window straddles a break are discarded and pullback episodes reset
   across one, otherwise the first bar back after the weekend reliably fakes a
   pivot. The source, on a 1m crypto-style chart, never has to deal with this.
@@ -101,8 +103,9 @@ Read these before trusting an alert.
 reimplementing them — a backtest that disagrees with the bot is worse than no
 backtest.
 
-It needs an OANDA API token (practice account is fine: *Manage API Access →
-Generate Personal Access Token*). The live bot does not use it.
+It fetches through `signal_bot.fetch_candles`, the same OANDA call the live
+bot polls with, so the two see identical data. Set `SIGNAL_INTERVAL=1m` to run
+the live bot on the bar size the backtest defaults to.
 
 ```bash
 export OANDA_API_TOKEN=...                 # OANDA_ENVIRONMENT=practice|live, default practice
@@ -159,9 +162,11 @@ is the annotated copy; this table is the complete list.
 | Variable | Default | Meaning |
 |---|---|---|
 | `DISCORD_WEBHOOK_URL` | — | **Required.** Where alerts are posted. |
-| `SIGNAL_TICKER` | — | **Required** by the launchers. Yahoo symbol, e.g. `GC=F`. |
-| `SIGNAL_INTERVAL` | `15m` | Bar size: `1m`, `5m`, `15m`, `1h`, `1d`. |
-| `SIGNAL_LOOKBACK` | `10d` | History pulled each poll. Must clear the EMA warm-up. |
+| `OANDA_API_TOKEN` | — | **Required.** Practice-account token recommended. |
+| `OANDA_ENVIRONMENT` | `practice` | `practice` or `live`. |
+| `SIGNAL_TICKER` | — | **Required** by the launchers. OANDA instrument, e.g. `XAU_USD`. |
+| `SIGNAL_INTERVAL` | `15m` | Bar size: `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`. |
+| `SIGNAL_LOOKBACK` | `10d` | History pulled each poll (`m`/`h`/`d`). Must clear the EMA warm-up. |
 | `SIGNAL_EMA_FAST` | `20` | Fast EMA. |
 | `SIGNAL_EMA_MID` | `50` | Mid EMA. Depth-1 stop reference. |
 | `SIGNAL_EMA_SLOW` | `100` | Slow EMA. Depth-2 stop reference, and the veto line. |
@@ -177,18 +182,16 @@ is the annotated copy; this table is the complete list.
 | `SIGNAL_MIN_STACK_SEP_ATR` | `0.0` | Minimum fast-to-slow separation, in ATRs. `0` = off. |
 | `SIGNAL_MAX_RISK_ATR` | `0.0` | Reject setups whose stop is wider than this. `0` = off. |
 | `SIGNAL_ATR_LEN` | `14` | ATR period (Wilder smoothing). |
-| `SIGNAL_DROP_UNCLOSED_BAR` | `true` | Ignore the in-progress candle yfinance returns. |
+| `SIGNAL_DROP_UNCLOSED_BAR` | `true` | Clock-based backstop against acting on the in-progress candle. |
 | `SIGNAL_SESSION_GAP_MULT` | `2.0` | Intervals of silence that count as a session break. |
 | `SIGNAL_COOLDOWN_BARS` | `4` | Minimum bars between same-direction alerts. |
 | `SIGNAL_WEAK_STRENGTH_CAP` | `0.5` | Ceiling on a WEAK alert's strength score. |
 | `SIGNAL_POLL_SECONDS` | `300` | Seconds between polls. |
-| `OANDA_API_TOKEN` | — | **Required** by `backtest.py` only. |
-| `OANDA_ENVIRONMENT` | `practice` | `practice` or `live`. `backtest.py` only. |
 
 Alerts are throttled by state in `.state_<ticker>.json`: a repeat of the same
 direction and tier is suppressed, a WEAK→STRONG upgrade is not, and the
 cooldown is counted in bars rather than wall clock so it behaves across the
-settlement break. State is written only after Discord confirms delivery, so a
+daily break. State is written only after Discord confirms delivery, so a
 dropped alert is retried rather than recorded as sent.
 
 ## Not financial advice

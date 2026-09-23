@@ -5,9 +5,14 @@ Run locally:
     pip install pytest pandas numpy
     pytest test_signal_bot.py -v
 
-No network calls happen: yfinance/requests in run_once() and
+No network calls happen: the OANDA fetch in run_once() and
 send_discord_alert()/send_startup_message() are only exercised via mocks.
 """
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -822,6 +827,7 @@ class _RunOnceEnv:
         # The final row of the frame run_once() reads its price and EMAs from.
         # Tests reassign this before calling run_once().
         self.curr = dict(BUY_CURR)
+        self.fetches = []
 
     def indicator_frame(self, df):
         return make_signal_df(len(df), self.curr).set_index(df.index)
@@ -844,7 +850,11 @@ def run_once_env(tmp_path, monkeypatch):
         {"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 112.0, "Volume": 0.0},
         index=idx,
     )
-    monkeypatch.setattr(signal_bot.yf, "download", lambda *a, **k: raw.copy())
+    def fetch(*args, **kwargs):
+        env.fetches.append(args)
+        return raw.copy()
+
+    monkeypatch.setattr(signal_bot, "fetch_candles", fetch)
     monkeypatch.setattr(signal_bot, "drop_unclosed_bar", lambda df: df)
     monkeypatch.setattr(signal_bot, "compute_indicators", env.indicator_frame)
     return env
@@ -988,6 +998,57 @@ class TestRunOnceRefusedTrades:
         signal_bot.run_once()
         assert len(run_once_env.sent) == 1
         assert signal_bot.load_last_signal()["signal"] == "BUY"
+
+
+class TestRunOnceDataSource:
+    """run_once() polls OANDA for the configured instrument, bar size and lookback."""
+
+    def test_fetches_the_configured_instrument_granularity_and_window(
+        self, run_once_env, monkeypatch
+    ):
+        monkeypatch.setattr(signal_bot, "TICKER", "XAU_USD")
+        monkeypatch.setattr(signal_bot, "INTERVAL", "15m")
+        monkeypatch.setattr(signal_bot, "LOOKBACK", "10d")
+        monkeypatch.setattr(signal_bot, "detect_signal", lambda df: (None, 0.0, None, 0, ""))
+        signal_bot.run_once()
+
+        (instrument, granularity, start, end), = run_once_env.fetches
+        assert (instrument, granularity) == ("XAU_USD", "M15")
+        assert end - start == pd.Timedelta(days=10)
+        assert str(end.tz) == "UTC"
+
+    def test_empty_fetch_is_skipped_quietly(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "fetch_candles", lambda *a, **k: pd.DataFrame())
+        signal_bot.run_once()
+        assert run_once_env.sent == []
+
+
+class TestOandaGranularity:
+    @pytest.mark.parametrize("interval,expected", [
+        ("1m", "M1"), ("5m", "M5"), ("15m", "M15"), ("30m", "M30"),
+        ("1h", "H1"), ("60m", "H1"), ("4h", "H4"), ("1d", "D"),
+    ])
+    def test_maps_interval_to_granularity(self, interval, expected):
+        assert signal_bot.oanda_granularity(interval) == expected
+
+    def test_uses_module_interval_by_default(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "INTERVAL", "1h")
+        assert signal_bot.oanda_granularity() == "H1"
+
+    def test_size_oanda_has_no_candle_for_is_rejected(self):
+        with pytest.raises(ValueError, match="no OANDA granularity"):
+            signal_bot.oanda_granularity("3m")
+
+
+def test_bot_refuses_to_start_without_an_oanda_token():
+    """Fails at launch with a clear message, not as an error every poll."""
+    env = {k: v for k, v in os.environ.items() if k != "OANDA_API_TOKEN"}
+    result = subprocess.run(
+        [sys.executable, "signal_bot.py"], env=env, capture_output=True, text=True,
+        cwd=Path(__file__).parent, timeout=60,
+    )
+    assert result.returncode != 0
+    assert "OANDA_API_TOKEN is not set" in result.stderr
 
 
 # ---------------------------------------------------------------------------

@@ -35,19 +35,24 @@ Three things this bot has to get right that a naive implementation does not:
     happened n bars earlier than any live bot could manage. Every arrow is
     shifted forward by n.
 
-  * yfinance returns the in-progress candle as the last row. All indicator
-    and signal logic runs on closed bars only.
+  * The feed includes the in-progress candle. OANDA flags it complete=false
+    and it is dropped at fetch; drop_unclosed_bar re-checks by clock. All
+    indicator and signal logic runs on closed bars only.
 
-  * Gold futures have a daily settlement break and weekend gaps. Pivots whose
-    window spans a break are discarded and pullback episodes reset across one,
-    otherwise the first bar after the weekend reliably fakes a pivot.
+  * Gold has a daily break and weekend gaps. Pivots whose window spans a
+    break are discarded and pullback episodes reset across one, otherwise the
+    first bar after the weekend reliably fakes a pivot.
 
-This script never places trades — it only sends notifications for you to act
-on manually.
+Candles come from OANDA's v3 REST API (mid prices). The only endpoint this
+script calls is the candles one. OANDA tokens are not read-only, so use one
+from a practice account: its candles are the same, and it has no real money
+behind it. This script never places trades — it only sends notifications
+for you to act on manually.
 
 Setup:
-    pip install yfinance pandas requests
+    pip install pandas requests
     export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+    export OANDA_API_TOKEN="..."
     python signal_bot.py
 
 Config is via environment variables (see the block below).
@@ -60,12 +65,16 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-import yfinance as yf
 
 # ---- Config (override via environment variables) ----
-TICKER = os.environ.get("SIGNAL_TICKER", "")                 # Yahoo Finance ticker symbol
-INTERVAL = os.environ.get("SIGNAL_INTERVAL", "15m")          # 1m,5m,15m,1h,1d ...
+TICKER = os.environ.get("SIGNAL_TICKER", "")                 # OANDA instrument, e.g. XAU_USD
+INTERVAL = os.environ.get("SIGNAL_INTERVAL", "15m")          # 1m,5m,15m,30m,1h,4h,1d
 LOOKBACK = os.environ.get("SIGNAL_LOOKBACK", "10d")          # history window to pull each poll
+
+# Data source. Checked when the bot starts rather than at import, so the
+# backtest and the tests can import this module without one.
+OANDA_API_TOKEN = os.environ.get("OANDA_API_TOKEN", "")
+OANDA_ENVIRONMENT = os.environ.get("OANDA_ENVIRONMENT", "practice")  # practice | live
 
 # Trend filter: triple EMA
 EMA_FAST = int(os.environ.get("SIGNAL_EMA_FAST", 20))
@@ -153,6 +162,100 @@ def interval_minutes(interval=None):
     return int(text[:-1]) * units[text[-1]]
 
 
+OANDA_HOSTS = {
+    "practice": "https://api-fxpractice.oanda.com",
+    "live": "https://api-fxtrade.oanda.com",
+}
+
+# OANDA's ceiling on candles per request.
+OANDA_PAGE_SIZE = 5000
+
+_GRANULARITY_BY_MINUTES = {1: "M1", 5: "M5", 15: "M15", 30: "M30", 60: "H1", 240: "H4", 1440: "D"}
+
+
+def oanda_granularity(interval=None):
+    """'15m' -> 'M15', '1h' -> 'H1'. Raises for sizes OANDA has no candle for."""
+    minutes = interval_minutes(interval)
+    if minutes not in _GRANULARITY_BY_MINUTES:
+        raise ValueError(
+            f"no OANDA granularity for interval {interval or INTERVAL!r}; "
+            f"use one of 1m, 5m, 15m, 30m, 1h, 4h, 1d"
+        )
+    return _GRANULARITY_BY_MINUTES[minutes]
+
+
+def to_utc(value):
+    """Any timestamp-like -> tz-aware UTC Timestamp, naive input read as UTC."""
+    ts = pd.Timestamp(value)
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
+def fetch_candles(instrument, granularity, start, end, token=None, environment=None):
+    """
+    Closed mid-price candles for [start, end] from OANDA, as an OHLCV frame
+    indexed by UTC time.
+
+    The candles endpoint rejects `count` sent together with both `from` and
+    `to`, so every page is `from` + `count` and the cursor walks forward from
+    the last candle received. The final page usually runs past `end`; that
+    overshoot is trimmed after the fact.
+
+    Returns an empty frame when OANDA has nothing for the window. HTTP
+    failures (bad token, unknown instrument) raise requests.HTTPError carrying
+    OANDA's own error message.
+    """
+    token = token or OANDA_API_TOKEN
+    environment = environment or OANDA_ENVIRONMENT
+    if environment not in OANDA_HOSTS:
+        raise ValueError(
+            f"OANDA_ENVIRONMENT must be one of {sorted(OANDA_HOSTS)}, got {environment!r}"
+        )
+    start, end = to_utc(start), to_utc(end)
+
+    url = f"{OANDA_HOSTS[environment]}/v3/instruments/{instrument}/candles"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    rows = []
+    cursor = start
+    while True:
+        resp = requests.get(
+            url, headers=headers, timeout=30,
+            params={"granularity": granularity, "price": "M",
+                    "from": cursor.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                    "count": OANDA_PAGE_SIZE},
+        )
+        if not resp.ok:
+            raise requests.HTTPError(
+                f"OANDA {resp.status_code} for {instrument}: {resp.text}", response=resp
+            )
+        candles = resp.json().get("candles", [])
+        if not candles:
+            break
+        for c in candles:
+            mid = c["mid"]
+            rows.append({
+                "time": c["time"], "complete": c["complete"],
+                "Open": float(mid["o"]), "High": float(mid["h"]),
+                "Low": float(mid["l"]), "Close": float(mid["c"]),
+                "Volume": int(c["volume"]),
+            })
+        last = to_utc(candles[-1]["time"])
+        if last >= end or len(candles) < OANDA_PAGE_SIZE:
+            break
+        cursor = last + pd.Timedelta(microseconds=1)
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df[df["complete"].astype(bool)]
+    df = df.drop_duplicates(subset="time").sort_values("time")
+    df = df.set_index("time").drop(columns="complete")
+    df.index.name = None
+    return df[df.index <= end]
+
+
 def load_last_signal():
     """Return the last alert as a dict, or None if there is no usable state."""
     if not STATE_FILE.exists():
@@ -208,9 +311,10 @@ def _stack_open(fast, slow, atr):
 
 def drop_unclosed_bar(df):
     """
-    yfinance returns the in-progress candle as the final row. Acting on it
+    A feed can return the in-progress candle as the final row. Acting on it
     produces alerts for setups that may not exist by the candle's close, so
-    drop it unless its close time has already passed.
+    drop it unless its close time has already passed. fetch_candles already
+    drops OANDA's complete=false candle; this is the clock-based backstop.
     """
     if not DROP_UNCLOSED_BAR or df.empty:
         return df
@@ -234,7 +338,7 @@ def drop_unclosed_bar(df):
 def mark_session_gaps(df):
     """
     True on the first bar after a break longer than SESSION_GAP_MULT
-    intervals. Gold futures have a daily settlement break and weekends;
+    intervals. Gold has a daily break and weekends;
     a fractal spanning one is not a real pivot and a pullback episode
     should not survive it.
     """
@@ -640,13 +744,12 @@ def bars_since(df, bar_time):
 
 
 def run_once():
-    df = yf.download(TICKER, period=LOOKBACK, interval=INTERVAL, progress=False)
+    end = pd.Timestamp.now(tz="UTC")
+    start = end - pd.Timedelta(minutes=interval_minutes(LOOKBACK))
+    df = fetch_candles(TICKER, oanda_granularity(), start, end)
     if df.empty:
         print(f"[{TICKER}] no data returned this cycle, skipping")
         return
-
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
 
     df = drop_unclosed_bar(df)
 
@@ -676,7 +779,7 @@ def run_once():
         return
 
     # Cooldown is counted in bars off the stored bar time, not wall clock --
-    # wall clock would misbehave across the settlement break.
+    # wall clock would misbehave across the daily break.
     if not is_new_direction:
         elapsed = bars_since(df, last["bar_time"]) if last else None
         if elapsed is not None and elapsed < COOLDOWN_BARS:
@@ -710,6 +813,20 @@ def run_once():
 
 
 if __name__ == "__main__":
+    if not OANDA_API_TOKEN:
+        raise SystemExit(
+            "OANDA_API_TOKEN is not set. Generate one under Manage API Access "
+            "in your OANDA account and add it to .env."
+        )
+    # Bad values fail here, once, rather than as an error every poll.
+    oanda_granularity()
+    interval_minutes(LOOKBACK)
+    if OANDA_ENVIRONMENT not in OANDA_HOSTS:
+        raise SystemExit(
+            f"OANDA_ENVIRONMENT must be one of {sorted(OANDA_HOSTS)}, "
+            f"got {OANDA_ENVIRONMENT!r}."
+        )
+
     print(
         f"Watching {TICKER} on {INTERVAL} candles | "
         f"Trend: EMA {EMA_FAST}/{EMA_MID}/{EMA_SLOW} stacked | "
