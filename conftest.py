@@ -7,3 +7,7 @@ import os
 
 os.environ.setdefault("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/test/test")
 os.environ.setdefault("SIGNAL_TICKER", "TESTTICKER")
+# Forced, not defaulted: the fixtures build 15-minute bars, so any other
+# interval (the 1m default, or one sourced from .env) turns every bar into a
+# session gap.
+os.environ["SIGNAL_INTERVAL"] = "15m"

@@ -61,9 +61,10 @@ colours read backwards. `test_green_arrow_maps_to_the_swing_low` pins it.
 Read these before trusting an alert.
 
 - **Timeframe and instrument.** The source demonstrates this on 1-minute
-  charts. This bot ships configured for `XAU_USD` (spot gold, OANDA) on 15m
-  bars. That is a different market structure, and the parameters were not
-  re-tuned for it. See [Validation](#validation) for what that costs.
+  charts, and so does this bot (`SIGNAL_INTERVAL=1m`, the backtest's default
+  too). The instrument is `XAU_USD` (spot gold, OANDA), a different market
+  structure, and the parameters were not re-tuned for it. See
+  [Validation](#validation) for what that costs.
 - **The two-bar confirmation lag.** A fractal at bar *p* is only knowable at
   bar *p + 2*, because the two bars to its right have to close first.
   TradingView draws the arrow back at the pivot, so every chart example looks
@@ -104,8 +105,7 @@ reimplementing them — a backtest that disagrees with the bot is worse than no
 backtest.
 
 It fetches through `signal_bot.fetch_candles`, the same OANDA call the live
-bot polls with, so the two see identical data. Set `SIGNAL_INTERVAL=1m` to run
-the live bot on the bar size the backtest defaults to.
+bot polls with, so the two see identical data. Both default to 1-minute bars.
 
 ```bash
 export OANDA_API_TOKEN=...                 # OANDA_ENVIRONMENT=practice|live, default practice
@@ -165,8 +165,8 @@ is the annotated copy; this table is the complete list.
 | `OANDA_API_TOKEN` | — | **Required.** Practice-account token recommended. |
 | `OANDA_ENVIRONMENT` | `practice` | `practice` or `live`. |
 | `SIGNAL_TICKER` | — | **Required** by the launchers. OANDA instrument, e.g. `XAU_USD`. |
-| `SIGNAL_INTERVAL` | `15m` | Bar size: `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`. |
-| `SIGNAL_LOOKBACK` | `10d` | History pulled each poll (`m`/`h`/`d`). Must clear the EMA warm-up. |
+| `SIGNAL_INTERVAL` | `1m` | Bar size: `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`. |
+| `SIGNAL_LOOKBACK` | `3d` | History pulled each poll (`m`/`h`/`d`). Must clear the EMA warm-up, weekend included. |
 | `SIGNAL_EMA_FAST` | `20` | Fast EMA. |
 | `SIGNAL_EMA_MID` | `50` | Mid EMA. Depth-1 stop reference. |
 | `SIGNAL_EMA_SLOW` | `100` | Slow EMA. Depth-2 stop reference, and the veto line. |
@@ -186,7 +186,7 @@ is the annotated copy; this table is the complete list.
 | `SIGNAL_SESSION_GAP_MULT` | `2.0` | Intervals of silence that count as a session break. |
 | `SIGNAL_COOLDOWN_BARS` | `4` | Minimum bars between same-direction alerts. |
 | `SIGNAL_WEAK_STRENGTH_CAP` | `0.5` | Ceiling on a WEAK alert's strength score. |
-| `SIGNAL_POLL_SECONDS` | `300` | Seconds between polls. |
+| `SIGNAL_POLL_SECONDS` | `30` | Seconds between polls. Must be shorter than one bar, or bars get skipped. |
 
 Alerts are throttled by state in `.state_<ticker>.json`: a repeat of the same
 direction and tier is suppressed, a WEAK→STRONG upgrade is not, and the

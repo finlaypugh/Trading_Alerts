@@ -68,8 +68,8 @@ import requests
 
 # ---- Config (override via environment variables) ----
 TICKER = os.environ.get("SIGNAL_TICKER", "")                 # OANDA instrument, e.g. XAU_USD
-INTERVAL = os.environ.get("SIGNAL_INTERVAL", "15m")          # 1m,5m,15m,30m,1h,4h,1d
-LOOKBACK = os.environ.get("SIGNAL_LOOKBACK", "10d")          # history window to pull each poll
+INTERVAL = os.environ.get("SIGNAL_INTERVAL", "1m")           # 1m,5m,15m,30m,1h,4h,1d
+LOOKBACK = os.environ.get("SIGNAL_LOOKBACK", "3d")           # history window to pull each poll
 
 # Data source. Checked when the bot starts rather than at import, so the
 # backtest and the tests can import this module without one.
@@ -118,7 +118,7 @@ SESSION_GAP_MULT = float(os.environ.get("SIGNAL_SESSION_GAP_MULT", 2.0))
 # Alert throttling
 COOLDOWN_BARS = int(os.environ.get("SIGNAL_COOLDOWN_BARS", 4))
 
-POLL_SECONDS = int(os.environ.get("SIGNAL_POLL_SECONDS", 300))
+POLL_SECONDS = int(os.environ.get("SIGNAL_POLL_SECONDS", 30))
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]      # required, no default
 
 if FRACTAL_N < 2:
@@ -825,6 +825,15 @@ if __name__ == "__main__":
         raise SystemExit(
             f"OANDA_ENVIRONMENT must be one of {sorted(OANDA_HOSTS)}, "
             f"got {OANDA_ENVIRONMENT!r}."
+        )
+    if POLL_SECONDS >= interval_minutes() * 60:
+        # Only the last closed bar is evaluated, so any bar that closes and is
+        # superseded between two polls is never looked at. The backtest
+        # evaluates every bar, so the two would quietly disagree.
+        print(
+            f"WARNING: SIGNAL_POLL_SECONDS={POLL_SECONDS} is not shorter than one "
+            f"{INTERVAL} bar; some bars will never be evaluated. Use at most "
+            f"{interval_minutes() * 30}s."
         )
 
     print(
