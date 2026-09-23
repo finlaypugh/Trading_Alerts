@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# run.sh — set up (once) and launch the BTC signal bot.
+# run.sh — set up (once) and launch the signal bot for the configured ticker.
 #
 # Usage:
-#   1. Copy .env.example to .env and fill in DISCORD_WEBHOOK_URL (and any
-#      overrides you want, e.g. SIGNAL_INTERVAL).
+#   1. Copy .env.example to .env and fill in DISCORD_WEBHOOK_URL,
+#      OANDA_API_TOKEN and SIGNAL_TICKER (and any overrides you want,
+#      e.g. SIGNAL_INTERVAL).
 #   2. ./run.sh
 #
 # Re-running this script is safe: it reuses the existing venv and only
@@ -52,5 +53,17 @@ if [ -z "${DISCORD_WEBHOOK_URL:-}" ]; then
     exit 1
 fi
 
-echo "Starting signal bot for ${SIGNAL_TICKER:-BTC-USD}..."
+# No default. A silent fallback would run a strategy tuned for one instrument
+# against whatever the fallback happens to be.
+if [ -z "${SIGNAL_TICKER:-}" ]; then
+    echo "SIGNAL_TICKER is not set. Add it to .env before running (e.g. XAU_USD)."
+    exit 1
+fi
+
+if [ -z "${OANDA_API_TOKEN:-}" ]; then
+    echo "OANDA_API_TOKEN is not set. Add it to .env before running."
+    exit 1
+fi
+
+echo "Starting signal bot for ${SIGNAL_TICKER}..."
 exec python signal_bot.py
