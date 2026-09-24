@@ -772,16 +772,18 @@ def run_once():
         print(f"[{TICKER}] no setup on the last closed bar (last sent: {last_tier} {last_signal})")
         return
 
-    is_new_direction = signal != last_signal
-    is_upgrade = signal == last_signal and last_tier == "WEAK" and tier == "STRONG"
-    if not (is_new_direction or is_upgrade):
-        print(f"[{TICKER}] {tier} {signal} already sent, nothing new")
-        return
-
-    # Cooldown is counted in bars off the stored bar time, not wall clock --
-    # wall clock would misbehave across the daily break.
-    if not is_new_direction:
-        elapsed = bars_since(df, last["bar_time"]) if last else None
+    # An opposite signal always goes through. A same-direction one is a fresh
+    # setup once COOLDOWN_BARS have closed since the last alert -- the same
+    # rule the backtest applies -- not a repeat to be held back until the
+    # direction flips. Cooldown is counted in bars off the stored bar time,
+    # not wall clock, which would misbehave across the daily break.
+    if last and signal == last_signal:
+        elapsed = bars_since(df, last["bar_time"])
+        if elapsed == 0:
+            # Polled again before the next bar closed: this is the bar the
+            # stored alert was for.
+            print(f"[{TICKER}] {tier} {signal} already sent for this bar, nothing new")
+            return
         if elapsed is not None and elapsed < COOLDOWN_BARS:
             print(
                 f"[{TICKER}] {tier} {signal} suppressed, only {elapsed} bars "

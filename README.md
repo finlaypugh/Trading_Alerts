@@ -188,10 +188,11 @@ is the annotated copy; this table is the complete list.
 | `SIGNAL_WEAK_STRENGTH_CAP` | `0.5` | Ceiling on a WEAK alert's strength score. |
 | `SIGNAL_POLL_SECONDS` | `30` | Seconds between polls. Must be shorter than one bar, or bars get skipped. |
 
-Alerts are throttled by state in `.state_<ticker>.json`: a repeat of the same
-direction and tier is suppressed, a WEAK→STRONG upgrade is not, and the
-cooldown is counted in bars rather than wall clock so it behaves across the
-daily break. State is written only after Discord confirms delivery, so a
+Alerts are throttled by state in `.state_<ticker>.json`: an opposite-direction
+signal always goes through, a same-direction one waits `SIGNAL_COOLDOWN_BARS`
+bars after the last alert (as in the backtest), and a second poll of the same
+bar never re-sends. The cooldown is counted in bars rather than wall clock so
+it behaves across the daily break. State is written only after Discord confirms delivery, so a
 dropped alert is retried rather than recorded as sent.
 
 ## Not financial advice
