@@ -880,6 +880,34 @@ class TestCooldown:
         signal_bot.run_once()
         assert len(run_once_env.sent) == 1
 
+    def test_same_direction_and_tier_after_cooldown_is_allowed(
+        self, run_once_env, monkeypatch
+    ):
+        # Regression: a STRONG BUY after an old STRONG BUY used to be dropped
+        # as "already sent" forever, until a SELL reset the state.
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.save_last_signal("BUY", "STRONG", 1, str(run_once_env.index[-10]))
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
+        assert signal_bot.load_last_signal()["bar_time"] == str(run_once_env.index[-1])
+
+    def test_second_poll_of_the_same_bar_does_not_resend(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "COOLDOWN_BARS", 0)
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
+
+    def test_same_direction_with_no_stored_bar_time_fails_open(
+        self, run_once_env, monkeypatch
+    ):
+        # Legacy state files have no bar time; the cooldown cannot be counted,
+        # so the alert goes through rather than being swallowed.
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.STATE_FILE.write_text('"BUY"')
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
+
     def test_opposite_direction_is_never_suppressed(self, run_once_env, monkeypatch):
         monkeypatch.setattr(signal_bot, "detect_signal", detect_stub(signal="BUY"))
         signal_bot.save_last_signal("SELL", "STRONG", 1, str(run_once_env.index[-2]))
