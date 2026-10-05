@@ -29,6 +29,14 @@ STATUS_FIELDS = (
     "atr", "stack", "long_depth", "short_depth", "long_vetoed", "short_vetoed",
 )
 STATE_FIELDS = ("signal", "tier", "depth", "bar_time")
+BAR_FIELDS = (
+    "time", "open", "high", "low", "close", "ema_fast", "ema_mid", "ema_slow",
+    "green_arrow", "red_arrow",
+)
+ALERT_FIELDS = (
+    "sent_utc", "bar_time", "signal", "tier", "depth", "strength",
+    "price", "sl", "tp", "rr", "risk", "reason",
+)
 
 # Effective bot config shown in the UI: response key -> signal_bot attribute.
 # An allowlist, so the webhook URL and API token are excluded by construction.
@@ -90,6 +98,14 @@ def state_path():
     return ROOT / f".state_{ticker()}.json"
 
 
+def bars_path():
+    return ROOT / f".bars_{ticker()}.json"
+
+
+def alerts_path():
+    return ROOT / f".alerts_{ticker()}.jsonl"
+
+
 def _read_json(path):
     """(data, error). A missing file is (None, None), not an error."""
     try:
@@ -117,13 +133,25 @@ def _poll_seconds(value):
         return 30.0
 
 
-def _age_seconds(ts, now):
+def _parse_utc(ts):
+    """Aware datetime from an ISO string (naive means UTC), or None."""
     try:
         then = datetime.fromisoformat(ts)
     except (TypeError, ValueError):
         return None
-    if then.tzinfo is None:
-        then = then.replace(tzinfo=timezone.utc)
+    return then.replace(tzinfo=timezone.utc) if then.tzinfo is None else then
+
+
+def _epoch(ts):
+    """Unix seconds for an ISO string, or None. The chart keys bars on these."""
+    then = _parse_utc(ts)
+    return None if then is None else int(then.timestamp())
+
+
+def _age_seconds(ts, now):
+    then = _parse_utc(ts)
+    if then is None:
+        return None
     return max(0.0, (now - then).total_seconds())
 
 
@@ -173,6 +201,64 @@ def load_last_signal():
             error = f"{state_path().name} has no signal"
         return {"last_signal": None, "message": error or "no alert sent yet"}
     return {"last_signal": {k: _clean(data.get(k)) for k in STATE_FIELDS}, "message": None}
+
+
+def load_bars():
+    """The bot's recent bars for the chart, oldest first, each with a unix `ts`."""
+    path = bars_path()
+    data, error = _read_json(path)
+    if not isinstance(data, dict) or not isinstance(data.get("bars"), list):
+        if data is not None and error is None:
+            error = f"{path.name} has no bars"
+        return {"bars": [], "message": error or "no bars yet: the bot writes them once warmed up"}
+    bars = []
+    for raw in data["bars"]:
+        if not isinstance(raw, dict):
+            continue
+        ts = _epoch(raw.get("time"))
+        if ts is None:
+            continue
+        bars.append({**{k: _clean(raw.get(k)) for k in BAR_FIELDS}, "ts": ts})
+    return {
+        "ticker": _clean(data.get("ticker")),
+        "interval": _clean(data.get("interval")),
+        "bars": bars,
+        "message": None if bars else f"{path.name} has no usable bars",
+    }
+
+
+def load_alerts(n):
+    """
+    The newest n alerts from the bot's alert log, newest first, each with the
+    unix `ts` of the bar it fired on. Unparseable lines are skipped and
+    counted rather than failing the lot.
+    """
+    path = alerts_path()
+    try:
+        lines = _tail_file(path, n)
+    except FileNotFoundError:
+        return {"alerts": [], "skipped": 0, "message": "no alerts logged yet"}
+    except OSError as exc:
+        return {"alerts": [], "skipped": 0,
+                "message": f"{path.name} unreadable: {type(exc).__name__}"}
+    alerts, skipped = [], 0
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+        except ValueError:
+            raw = None
+        if not isinstance(raw, dict):
+            skipped += 1
+            continue
+        alerts.append({**{k: _clean(raw.get(k)) for k in ALERT_FIELDS},
+                       "ts": _epoch(raw.get("bar_time"))})
+    return {
+        "alerts": alerts,
+        "skipped": skipped,
+        "message": None if alerts else "no alerts logged yet",
+    }
 
 
 def bot_config():

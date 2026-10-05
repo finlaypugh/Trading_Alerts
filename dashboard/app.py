@@ -24,6 +24,7 @@ app.json.sort_keys = False
 log = logging.getLogger("dashboard")
 
 MAX_LOG_LINES = 500
+MAX_ALERTS = 500
 
 # Action attempts per client IP, counted before the token check so it also
 # slows token guessing.
@@ -93,6 +94,17 @@ def api_status():
 @app.get("/api/last-signal")
 def api_last_signal():
     return jsonify(status.load_last_signal())
+
+
+@app.get("/api/bars")
+def api_bars():
+    return jsonify(status.load_bars())
+
+
+@app.get("/api/alerts")
+def api_alerts():
+    n = request.args.get("n", 50, type=int)
+    return jsonify(status.load_alerts(max(1, min(n, MAX_ALERTS))))
 
 
 @app.get("/api/config")
