@@ -3,11 +3,16 @@ Tests for dashboard/. Flask test client only: no network, no real
 systemctl or journalctl, and the bot's files live in tmp_path.
 """
 import json
+import logging
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 import signal_bot
+from dashboard import actions
 from dashboard import app as app_module
 from dashboard import status
 
@@ -254,6 +259,341 @@ class TestLogs:
         data = client.get("/api/logs").json
         assert data["lines"] == []
         assert "DASHBOARD_LOG_FILE" in data["message"]
+
+
+# ---------------------------------------------------------------------------
+# Actions: auth, routing, locking
+# ---------------------------------------------------------------------------
+
+TOKEN = {"X-Token": "test-token"}
+
+
+@pytest.fixture(autouse=True)
+def clean_action_state(monkeypatch):
+    monkeypatch.setenv("DASHBOARD_TOKEN", "test-token")
+    app_module._attempts.clear()
+    yield
+    app_module._attempts.clear()
+
+
+@pytest.fixture
+def executed(monkeypatch):
+    """Record actions that actually ran, without running them."""
+    ran = []
+
+    def fake_execute(action):
+        ran.append(action.name)
+        return {"ok": True, "output": "", "duration_ms": 0}
+
+    monkeypatch.setattr(app_module.actions, "execute", fake_execute)
+    return ran
+
+
+@pytest.fixture
+def fake_subprocess(monkeypatch):
+    """Capture subprocess.run calls made by actions.py."""
+    calls = []
+    result = {"returncode": 0, "stdout": "done\n", "stderr": ""}
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args, result["returncode"],
+                                           result["stdout"], result["stderr"])
+
+    monkeypatch.setattr(actions.subprocess, "run", fake_run)
+    return calls, result
+
+
+ALL_ACTIONS = sorted(actions.ACTIONS)
+
+
+class TestActionAuth:
+    @pytest.mark.parametrize("name", ALL_ACTIONS + ["not_an_action"])
+    def test_missing_token_is_401(self, client, executed, name):
+        resp = client.post(f"/api/action/{name}")
+        assert resp.status_code == 401
+        assert resp.json["ok"] is False
+        assert executed == []
+
+    @pytest.mark.parametrize("name", ALL_ACTIONS)
+    def test_wrong_token_is_401(self, client, executed, name):
+        resp = client.post(f"/api/action/{name}", headers={"X-Token": "test-tokeN"})
+        assert resp.status_code == 401
+        assert executed == []
+
+    def test_unset_token_refuses_every_action(self, client, executed, monkeypatch):
+        monkeypatch.setenv("DASHBOARD_TOKEN", "")
+        resp = client.post("/api/action/test_alert", headers={"X-Token": ""})
+        assert resp.status_code == 503
+        assert "DASHBOARD_TOKEN" in resp.json["output"]
+        assert executed == []
+
+    def test_compare_is_constant_time(self, client, executed, monkeypatch):
+        seen = []
+        real = app_module.hmac.compare_digest
+        monkeypatch.setattr(
+            app_module.hmac, "compare_digest", lambda a, b: seen.append((a, b)) or real(a, b)
+        )
+        client.post("/api/action/poll_now", headers=TOKEN)
+        assert seen == [(b"test-token", b"test-token")]
+
+    def test_valid_token_runs_the_action(self, client, executed):
+        resp = client.post("/api/action/poll_now", headers=TOKEN)
+        assert resp.status_code == 200
+        assert executed == ["poll_now"]
+
+    def test_get_is_not_allowed(self, client, executed):
+        assert client.get("/api/action/poll_now", headers=TOKEN).status_code == 405
+        assert executed == []
+
+    def test_token_is_never_echoed(self, client, executed):
+        body = client.get("/").get_data(as_text=True)
+        body += client.get("/api/config").get_data(as_text=True)
+        assert "test-token" not in body
+
+
+class TestActionRouting:
+    def test_unknown_action_is_404(self, client, executed):
+        resp = client.post("/api/action/rm_rf", headers=TOKEN)
+        assert resp.status_code == 404
+        assert executed == []
+
+    def test_busy_is_409(self, client):
+        assert actions._lock.acquire(blocking=False)
+        try:
+            resp = client.post("/api/action/clear_state", headers=TOKEN)
+        finally:
+            actions._lock.release()
+        assert resp.status_code == 409
+        assert resp.json["ok"] is False
+
+    def test_lock_is_released_after_an_action(self, client, fake_subprocess):
+        client.post("/api/action/poll_now", headers=TOKEN)
+        assert client.post("/api/action/poll_now", headers=TOKEN).status_code == 200
+
+    def test_lock_is_released_after_an_action_raises(self, client, monkeypatch):
+        def boom(*a, **k):
+            raise RuntimeError("kaput")
+
+        monkeypatch.setattr(actions.subprocess, "run", boom)
+        resp = client.post("/api/action/poll_now", headers=TOKEN)
+        assert resp.json == {"ok": False, "output": "RuntimeError: kaput",
+                             "duration_ms": resp.json["duration_ms"]}
+        assert not actions._lock.locked()
+
+    def test_result_shape(self, client, fake_subprocess):
+        resp = client.post("/api/action/poll_now", headers=TOKEN)
+        assert set(resp.json) == {"ok", "output", "duration_ms"}
+        assert resp.json["ok"] is True
+        assert resp.json["output"] == "done"
+
+    def test_actions_are_logged_with_client_ip(self, client, fake_subprocess, caplog):
+        caplog.set_level(logging.INFO, logger="dashboard")
+        client.post("/api/action/poll_now", headers=TOKEN,
+                    environ_base={"REMOTE_ADDR": "192.168.1.23"})
+        client.post("/api/action/poll_now", environ_base={"REMOTE_ADDR": "192.168.1.66"})
+        assert "poll_now from 192.168.1.23 ok=True" in caplog.text
+        assert "poll_now from 192.168.1.66 refused (401)" in caplog.text
+
+
+class TestRateLimitAndOrigin:
+    def test_eleventh_attempt_in_a_minute_is_429(self, client, executed):
+        codes = [client.post("/api/action/poll_now", headers=TOKEN).status_code
+                 for _ in range(app_module.RATE_LIMIT + 1)]
+        assert codes == [200] * app_module.RATE_LIMIT + [429]
+
+    def test_failed_attempts_count_too(self, client, executed):
+        for _ in range(app_module.RATE_LIMIT):
+            client.post("/api/action/poll_now", headers={"X-Token": "guess"})
+        assert client.post("/api/action/poll_now", headers=TOKEN).status_code == 429
+        assert executed == []
+
+    def test_limit_is_per_ip(self, client, executed):
+        for _ in range(app_module.RATE_LIMIT):
+            client.post("/api/action/poll_now", headers=TOKEN,
+                        environ_base={"REMOTE_ADDR": "10.0.0.1"})
+        resp = client.post("/api/action/poll_now", headers=TOKEN,
+                           environ_base={"REMOTE_ADDR": "10.0.0.2"})
+        assert resp.status_code == 200
+
+    def test_window_slides(self):
+        for i in range(app_module.RATE_LIMIT):
+            assert not app_module.rate_limited("1.2.3.4", now=100.0 + i)
+        assert app_module.rate_limited("1.2.3.4", now=110.0)
+        assert not app_module.rate_limited("1.2.3.4", now=160.5)
+
+    def test_cross_origin_post_is_403(self, client, executed):
+        resp = client.post("/api/action/poll_now",
+                           headers={**TOKEN, "Origin": "http://evil.example"})
+        assert resp.status_code == 403
+        assert executed == []
+
+    def test_null_origin_is_403(self, client, executed):
+        resp = client.post("/api/action/poll_now", headers={**TOKEN, "Origin": "null"})
+        assert resp.status_code == 403
+
+    def test_same_origin_post_is_allowed(self, client, executed):
+        resp = client.post("/api/action/poll_now",
+                           headers={**TOKEN, "Origin": "http://localhost"})
+        assert resp.status_code == 200
+
+
+class TestSecurityHeaders:
+    @pytest.mark.parametrize("path", ["/", "/api/status", "/static/app.js", "/healthz"])
+    def test_headers_on_every_response(self, client, path):
+        resp = client.get(path)
+        assert "default-src 'self'" in resp.headers["Content-Security-Policy"]
+        assert resp.headers["X-Content-Type-Options"] == "nosniff"
+        assert "Access-Control-Allow-Origin" not in resp.headers
+
+    def test_no_cors_on_actions(self, client, executed):
+        resp = client.post("/api/action/poll_now",
+                           headers={**TOKEN, "Origin": "http://localhost"})
+        assert not any(h.lower().startswith("access-control-") for h in resp.headers.keys())
+
+    def test_api_responses_are_not_cached(self, client):
+        assert client.get("/api/status").headers["Cache-Control"] == "no-store"
+
+    def test_page_has_no_inline_script_or_style(self, client):
+        html = client.get("/").get_data(as_text=True)
+        assert "<script>" not in html and "<style" not in html and " style=" not in html
+
+    def test_buttons_disabled_without_a_token(self, client, monkeypatch):
+        monkeypatch.setenv("DASHBOARD_TOKEN", "")
+        html = client.get("/").get_data(as_text=True)
+        assert html.count("DASHBOARD_TOKEN is not set") == len(actions.ACTIONS)
+
+
+# ---------------------------------------------------------------------------
+# Actions: what they run
+# ---------------------------------------------------------------------------
+
+class TestSubprocessSafety:
+    @pytest.mark.parametrize("name", ["poll_now", "update_deps",
+                                      "start_bot", "restart_bot", "stop_bot"])
+    def test_list_args_no_shell_and_a_timeout(self, client, fake_subprocess, monkeypatch, name):
+        monkeypatch.setattr(actions.sys, "platform", "linux")
+        calls, _ = fake_subprocess
+        client.post(f"/api/action/{name}", headers=TOKEN)
+        (args, kwargs), = calls
+        assert isinstance(args, list) and all(isinstance(a, str) for a in args)
+        assert kwargs.get("shell") is not True
+        assert kwargs["timeout"] > 0
+        assert kwargs["stdin"] is subprocess.DEVNULL
+
+    @pytest.mark.parametrize("name,verb", [
+        ("start_bot", "start"), ("restart_bot", "restart"), ("stop_bot", "stop"),
+    ])
+    def test_systemctl_matches_the_sudoers_rule(self, client, fake_subprocess, monkeypatch,
+                                                name, verb):
+        monkeypatch.setattr(actions.sys, "platform", "linux")
+        calls, _ = fake_subprocess
+        client.post(f"/api/action/{name}", headers=TOKEN)
+        (args, _kwargs), = calls
+        assert args == ["sudo", "-n", "/bin/systemctl", verb, "signal-bot"]
+        rule = (Path(__file__).parent / "deploy" / "sudoers-signal-bot").read_text()
+        assert f"/bin/systemctl {verb} signal-bot" in rule
+
+    @pytest.mark.parametrize("platform", ["darwin", "win32"])
+    @pytest.mark.parametrize("name", ["start_bot", "restart_bot", "stop_bot"])
+    def test_non_linux_is_unsupported_without_calling_systemctl(
+        self, client, fake_subprocess, monkeypatch, platform, name
+    ):
+        monkeypatch.setattr(actions.sys, "platform", platform)
+        calls, _ = fake_subprocess
+        resp = client.post(f"/api/action/{name}", headers=TOKEN)
+        assert resp.status_code == 200
+        assert resp.json["ok"] is False
+        assert "not supported" in resp.json["output"]
+        assert calls == []
+
+    def test_failed_command_is_not_ok(self, client, fake_subprocess):
+        _, result = fake_subprocess
+        result.update(returncode=1, stdout="", stderr="Traceback: boom")
+        resp = client.post("/api/action/poll_now", headers=TOKEN)
+        assert resp.json["ok"] is False
+        assert "boom" in resp.json["output"]
+
+    def test_timeout_is_reported(self, client, monkeypatch):
+        def slow(args, **kwargs):
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"], output=b"partial")
+
+        monkeypatch.setattr(actions.subprocess, "run", slow)
+        resp = client.post("/api/action/poll_now", headers=TOKEN)
+        assert resp.json["ok"] is False
+        assert "timed out" in resp.json["output"]
+        assert "partial" in resp.json["output"]
+
+    def test_output_is_truncated_to_4kb_keeping_the_tail(self, client, fake_subprocess):
+        _, result = fake_subprocess
+        result["stdout"] = "x" * 10_000 + "THE END"
+        out = client.post("/api/action/poll_now", headers=TOKEN).json["output"]
+        assert len(out) <= actions.OUTPUT_LIMIT + 20
+        assert out.endswith("THE END")
+
+    def test_output_is_redacted(self, client, fake_subprocess):
+        _, result = fake_subprocess
+        result["stderr"] = f"HTTPError: 404 Client Error for url: {SENTINEL}"
+        body = client.post("/api/action/poll_now", headers=TOKEN).get_data(as_text=True)
+        assert SENTINEL_TAIL not in body
+
+
+class TestActionBehaviour:
+    def test_test_alert_posts_a_labelled_message(self, client, monkeypatch):
+        posted = []
+
+        class Resp:
+            status_code = 204
+
+            def raise_for_status(self):
+                pass
+
+        monkeypatch.setattr(actions.requests, "post",
+                            lambda url, json, timeout: posted.append((url, json)) or Resp())
+        resp = client.post("/api/action/test_alert", headers=TOKEN)
+        assert resp.json["ok"] is True
+        (url, payload), = posted
+        assert url == SENTINEL
+        assert "Test message" in payload["content"]
+        assert SENTINEL_TAIL not in resp.get_data(as_text=True)
+
+    def test_test_alert_failure_does_not_leak_the_webhook(self, client, monkeypatch):
+        def fail(url, json, timeout):
+            raise actions.requests.HTTPError(f"404 Client Error: Not Found for url: {url}")
+
+        monkeypatch.setattr(actions.requests, "post", fail)
+        resp = client.post("/api/action/test_alert", headers=TOKEN)
+        assert resp.json["ok"] is False
+        assert SENTINEL_TAIL not in resp.get_data(as_text=True)
+
+    def test_clear_state_deletes_the_state_file(self, client):
+        status.state_path().write_text('{"signal": "BUY"}')
+        resp = client.post("/api/action/clear_state", headers=TOKEN)
+        assert resp.json["ok"] is True
+        assert not status.state_path().exists()
+
+    def test_clear_state_without_a_file_is_fine(self, client):
+        resp = client.post("/api/action/clear_state", headers=TOKEN)
+        assert resp.json["ok"] is True
+        assert "did not exist" in resp.json["output"]
+
+    def test_poll_now_runs_run_once_in_the_bot_directory(self, client, fake_subprocess):
+        calls, _ = fake_subprocess
+        client.post("/api/action/poll_now", headers=TOKEN)
+        (args, kwargs), = calls
+        assert args[0] == sys.executable
+        assert "signal_bot.run_once()" in args[-1]
+        assert kwargs["cwd"] == status.ROOT
+
+    def test_update_deps_uses_this_interpreters_pip(self, client, fake_subprocess):
+        calls, _ = fake_subprocess
+        client.post("/api/action/update_deps", headers=TOKEN)
+        (args, _kwargs), = calls
+        assert args == [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]
+
+    def test_destructive_actions_require_confirmation(self):
+        confirmed = {name for name, a in actions.ACTIONS.items() if a.confirm}
+        assert confirmed == {"restart_bot", "stop_bot", "clear_state", "update_deps"}
 
 
 def test_healthz(client):
