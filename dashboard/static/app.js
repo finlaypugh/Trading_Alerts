@@ -130,7 +130,41 @@ async function refresh() {
   }
 }
 
+// ---- quick commands ----
+
+function showOutput(text, ok) {
+  const out = $("action_output");
+  out.hidden = false;
+  out.className = ok ? "" : "fail";
+  out.textContent = text;
+}
+
+async function runAction(button) {
+  const name = button.dataset.action;
+  const label = button.textContent.trim();
+  if (button.dataset.confirm && !window.confirm(`${label}?`)) return;
+
+  const buttons = document.querySelectorAll("button[data-action]");
+  buttons.forEach((b) => { b.dataset.wasDisabled = b.disabled ? "1" : ""; b.disabled = true; });
+  showOutput(`${label}: running…`, true);
+  try {
+    const resp = await fetch(`/api/action/${encodeURIComponent(name)}`, { method: "POST" });
+    let body;
+    try { body = await resp.json(); } catch { body = { ok: false, output: `HTTP ${resp.status}` }; }
+    const took = typeof body.duration_ms === "number" ? ` (${body.duration_ms} ms)` : "";
+    showOutput(`${label}: ${body.ok ? "ok" : "failed"}${took}\n\n${body.output || ""}`, body.ok);
+  } catch (err) {
+    showOutput(`${label}: ${err.message}`, false);
+  } finally {
+    buttons.forEach((b) => { b.disabled = b.dataset.wasDisabled === "1"; });
+    refresh();
+  }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll("button[data-action]").forEach((b) => {
+    b.addEventListener("click", () => runAction(b));
+  });
   getJSON("/api/config").then(renderConfig).catch(() => {});
   refresh();
   setInterval(refresh, REFRESH_MS);

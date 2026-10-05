@@ -4,19 +4,22 @@ imports its polling loop, so a dashboard crash cannot stop alerts.
 
     python -m dashboard            # waitress on DASHBOARD_HOST:DASHBOARD_PORT
 """
+import logging
+
 from flask import Flask, jsonify, render_template, request
 
-from . import status
+from . import actions, status
 
 app = Flask(__name__)
 app.json.sort_keys = False
+log = logging.getLogger("dashboard")
 
 MAX_LOG_LINES = 500
 
 
 @app.get("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", actions=actions.ACTIONS.values())
 
 
 @app.get("/api/status")
@@ -38,6 +41,22 @@ def api_config():
 def api_logs():
     n = request.args.get("n", 100, type=int)
     return jsonify(status.log_tail(max(1, min(n, MAX_LOG_LINES))))
+
+
+@app.post("/api/action/<name>")
+def api_action(name):
+    ip = request.remote_addr
+    action = actions.ACTIONS.get(name)
+    if action is None:
+        log.warning("unknown action %r from %s", name, ip)
+        return jsonify(ok=False, output=f"unknown action {name!r}"), 404
+    try:
+        result = actions.execute(action)
+    except actions.Busy:
+        log.warning("action %s from %s refused: busy", name, ip)
+        return jsonify(ok=False, output="another action is still running"), 409
+    log.info("action %s from %s ok=%s in %dms", name, ip, result["ok"], result["duration_ms"])
+    return jsonify(result)
 
 
 @app.get("/healthz")

@@ -51,6 +51,17 @@
   </section>
 
   <section class="card">
+    <h2>Quick commands</h2>
+    <div class="buttons">
+      {% for a in actions %}
+      <button type="button" data-action="{{ a.name }}"{% if a.confirm %} data-confirm="1" class="danger"{% endif %}
+              {% if not a.supported %}disabled title="Needs systemd (Linux)"{% endif %}>{{ a.label }}</button>
+      {% endfor %}
+    </div>
+    <pre id="action_output" hidden></pre>
+  </section>
+
+  <section class="card">
     <h2>Log <span class="muted small" id="log_source"></span></h2>
     <pre id="logs">–</pre>
   </section>

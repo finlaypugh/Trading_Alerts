@@ -84,5 +84,18 @@ pre {
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
+.buttons {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px;
+}
+button {
+  font: inherit; padding: 10px 12px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button.danger { color: var(--bad); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+#action_output { margin-top: 10px; }
+#action_output.fail { outline: 1px solid var(--bad); }
+
 summary { cursor: pointer; font-weight: 600; }
 details .grid { margin-top: 10px; }
