@@ -1,0 +1,19 @@
+# Install: sudo cp deploy/signal-bot.service /etc/systemd/system/
+# Edit User and paths if not pi / /home/pi/Trading_Alerts. The unit name is
+# what the dashboard's buttons and deploy/sudoers-signal-bot refer to.
+[Unit]
+Description=Trading signal bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/Trading_Alerts
+EnvironmentFile=/home/pi/Trading_Alerts/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/pi/Trading_Alerts/.venv/bin/python signal_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+# Lets the dashboard start/stop/restart the bot, and nothing else.
+# Paths must match dashboard/actions.py (SYSTEMCTL) exactly. Change `pi` if
+# the services run as another user. Install with:
+#   sudo install -m 0440 deploy/sudoers-signal-bot /etc/sudoers.d/signal-bot
+#   sudo visudo -c
+pi ALL=(root) NOPASSWD: /bin/systemctl restart signal-bot, /bin/systemctl stop signal-bot, /bin/systemctl start signal-bot

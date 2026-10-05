@@ -8,6 +8,7 @@ Run locally:
 No network calls happen: the OANDA fetch in run_once() and
 send_discord_alert()/send_startup_message() are only exercised via mocks.
 """
+import json
 import os
 import subprocess
 import sys
@@ -1049,6 +1050,178 @@ class TestRunOnceDataSource:
         monkeypatch.setattr(signal_bot, "fetch_candles", lambda *a, **k: pd.DataFrame())
         signal_bot.run_once()
         assert run_once_env.sent == []
+
+
+# ---------------------------------------------------------------------------
+# Status file (read by dashboard/)
+# ---------------------------------------------------------------------------
+
+def read_status():
+    return json.loads(signal_bot.STATUS_FILE.read_text())
+
+
+class TestWriteStatus:
+    def test_writes_fields_plus_identity(self):
+        signal_bot.write_status(result="no_setup", close=1.5)
+        status = read_status()
+        assert status["result"] == "no_setup"
+        assert status["close"] == 1.5
+        assert status["ticker"] == signal_bot.TICKER
+        assert status["interval"] == signal_bot.INTERVAL
+        assert status["poll_seconds"] == signal_bot.POLL_SECONDS
+        assert status["ts_utc"].endswith("+00:00")
+
+    def test_replaces_atomically_and_leaves_no_temp_files(self, monkeypatch):
+        replaced = []
+        real_replace = os.replace
+        monkeypatch.setattr(
+            signal_bot.os, "replace",
+            lambda src, dst: replaced.append((src, dst)) or real_replace(src, dst),
+        )
+        signal_bot.write_status(result="sent")
+        (src, dst), = replaced
+        assert Path(src).parent == signal_bot.STATUS_FILE.parent
+        assert Path(dst) == signal_bot.STATUS_FILE
+        assert [p.name for p in signal_bot.STATUS_FILE.parent.iterdir()] == [
+            signal_bot.STATUS_FILE.name
+        ]
+
+    def test_failed_replace_keeps_the_old_file_and_does_not_raise(self, monkeypatch):
+        signal_bot.write_status(result="sent")
+        before = signal_bot.STATUS_FILE.read_text()
+
+        def boom(src, dst):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(signal_bot.os, "replace", boom)
+        signal_bot.write_status(result="no_setup")
+        assert signal_bot.STATUS_FILE.read_text() == before
+        assert len(list(signal_bot.STATUS_FILE.parent.iterdir())) == 1
+
+    def test_nan_is_written_as_null_not_invalid_json(self, run_once_env, monkeypatch):
+        run_once_env.curr = dict(BUY_CURR, atr=float("nan"))
+        monkeypatch.setattr(signal_bot, "detect_signal", lambda df: (None, 0.0, None, 0, ""))
+        signal_bot.run_once()
+        assert "NaN" not in signal_bot.STATUS_FILE.read_text()
+        assert read_status()["atr"] is None
+
+
+class TestRunOnceStatus:
+    """run_once() records every outcome, including skips and errors."""
+
+    def test_no_setup(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", lambda df: (None, 0.0, None, 0, ""))
+        signal_bot.run_once()
+        status = read_status()
+        assert status["result"] == "no_setup"
+        assert status["last_poll_ok"] is True
+        assert status["last_error"] is None
+        assert status["consecutive_errors"] == 0
+        assert status["bars_loaded"] == signal_bot.MIN_BARS
+        assert status["last_bar_time"] == str(run_once_env.index[-1])
+        assert status["close"] == 112.0
+        assert status["stack"] == "bull"
+        assert status["long_depth"] == 1
+        assert status["long_vetoed"] is False
+
+    def test_sent(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        assert read_status()["result"] == "sent"
+
+    def test_suppressed(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.save_last_signal("BUY", "STRONG", 1, str(run_once_env.index[-3]))
+        signal_bot.run_once()
+        assert read_status()["result"] == "suppressed"
+
+    def test_refused(self, run_once_env, monkeypatch):
+        run_once_env.curr = TestRunOnceRefusedTrades.WRONG_SIDE
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        assert read_status()["result"] == "refused"
+
+    def test_no_data(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "fetch_candles", lambda *a, **k: pd.DataFrame())
+        signal_bot.run_once()
+        assert read_status()["result"] == "no_data"
+
+    def test_bear_stack_is_labelled(self, run_once_env, monkeypatch):
+        run_once_env.curr = dict(SELL_CURR)
+        monkeypatch.setattr(signal_bot, "detect_signal", lambda df: (None, 0.0, None, 0, ""))
+        signal_bot.run_once()
+        assert read_status()["stack"] == "bear"
+
+    def test_exception_is_recorded_and_still_raised(self, run_once_env, monkeypatch):
+        def boom(*a, **k):
+            raise signal_bot.requests.ConnectionError("OANDA unreachable")
+
+        monkeypatch.setattr(signal_bot, "fetch_candles", boom)
+        with pytest.raises(signal_bot.requests.ConnectionError):
+            signal_bot.run_once()
+        status = read_status()
+        assert status["result"] == "error"
+        assert status["last_poll_ok"] is False
+        assert "OANDA unreachable" in status["last_error"]
+        assert status["consecutive_errors"] == 1
+
+    def test_consecutive_errors_count_up_then_reset(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", lambda df: (None, 0.0, None, 0, ""))
+        real_fetch = signal_bot.fetch_candles
+
+        def boom(*a, **k):
+            raise RuntimeError("down")
+
+        monkeypatch.setattr(signal_bot, "fetch_candles", boom)
+        for _ in range(3):
+            with pytest.raises(RuntimeError):
+                signal_bot.run_once()
+        assert read_status()["consecutive_errors"] == 3
+
+        monkeypatch.setattr(signal_bot, "fetch_candles", real_fetch)
+        signal_bot.run_once()
+        assert read_status()["consecutive_errors"] == 0
+
+    def test_webhook_url_never_reaches_the_status_file(self, run_once_env, monkeypatch):
+        # requests puts the URL in HTTPError messages: "... for url: <webhook>".
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+
+        def boom(*a, **k):
+            raise signal_bot.requests.HTTPError(
+                f"404 Client Error for url: {signal_bot.DISCORD_WEBHOOK_URL}"
+            )
+
+        monkeypatch.setattr(signal_bot, "send_discord_alert", boom)
+        with pytest.raises(signal_bot.requests.HTTPError):
+            signal_bot.run_once()
+        assert signal_bot.DISCORD_WEBHOOK_URL not in signal_bot.STATUS_FILE.read_text()
+        assert "<webhook>" in read_status()["last_error"]
+
+    def test_webhook_path_from_a_connection_error_is_redacted(self, run_once_env, monkeypatch):
+        # urllib3 quotes only the path: "Max retries exceeded with url: /api/webhooks/..."
+        monkeypatch.setattr(signal_bot, "DISCORD_WEBHOOK_URL",
+                            "https://discord.com/api/webhooks/123/SECRET-token")
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+
+        def boom(*a, **k):
+            raise signal_bot.requests.ConnectionError(
+                "HTTPSConnectionPool(host='discord.com', port=443): Max retries exceeded "
+                "with url: /api/webhooks/123/SECRET-token (Caused by NameResolutionError)"
+            )
+
+        monkeypatch.setattr(signal_bot, "send_discord_alert", boom)
+        with pytest.raises(signal_bot.requests.ConnectionError):
+            signal_bot.run_once()
+        assert "SECRET-token" not in signal_bot.STATUS_FILE.read_text()
+
+    def test_a_status_write_failure_does_not_break_the_poll(
+        self, run_once_env, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(signal_bot, "STATUS_FILE", tmp_path / "missing" / "status.json")
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
+        assert signal_bot.load_last_signal()["signal"] == "BUY"
 
 
 class TestOandaGranularity:

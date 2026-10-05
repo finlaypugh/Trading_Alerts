@@ -3,5 +3,6 @@
 __pycache__/
 *.pyc
 .state_*.json
+.status_*
 .idea/
 .pytest_cache/

@@ -59,9 +59,13 @@ Config is via environment variables (see the block below).
 """
 
 import json
+import math
 import os
+import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pandas as pd
 import requests
@@ -143,6 +147,8 @@ STRAT2_NAME = f"EMA{EMA_FAST}/{EMA_MID}/{EMA_SLOW}"
 WEAK_STRENGTH_CAP = float(os.environ.get("SIGNAL_WEAK_STRENGTH_CAP", 0.5))
 
 STATE_FILE = Path(__file__).parent / f".state_{TICKER.replace('/', '_')}.json"
+# Rewritten after every poll for dashboard/. Read-only to everything else.
+STATUS_FILE = Path(__file__).parent / f".status_{TICKER.replace('/', '_')}.json"
 
 # Enough history for the slowest EMA to settle, plus a full fractal window
 # (n bars either side of a pivot, plus the n-bar confirmation delay).
@@ -290,6 +296,92 @@ def save_last_signal(signal, tier, depth, bar_time):
             }
         )
     )
+
+
+def _finite(x):
+    """float, or None for NaN/inf/missing. JSON has no NaN."""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def _redact(text):
+    """Strip the webhook URL out of text bound for the status file.
+
+    Connection errors carry only its path ("... with url: /api/webhooks/<id>/
+    <token>"), so the path is stripped too.
+    """
+    text = str(text)
+    if not DISCORD_WEBHOOK_URL:
+        return text
+    text = text.replace(DISCORD_WEBHOOK_URL, "<webhook>")
+    path = urlsplit(DISCORD_WEBHOOK_URL).path
+    return text.replace(path, "<webhook>") if len(path) > 1 else text
+
+
+def write_status(**fields):
+    """
+    Atomically replace STATUS_FILE with this poll's outcome, for the dashboard.
+    Written to a temp file in the same directory, then os.replace'd, so a
+    reader never sees half a file. Never raises: a status failure must not
+    cost a poll.
+    """
+    try:
+        payload = {
+            "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ticker": TICKER,
+            "interval": INTERVAL,
+            "poll_seconds": POLL_SECONDS,
+            **fields,
+        }
+        text = json.dumps(payload, default=str, allow_nan=False)
+        fd, tmp = tempfile.mkstemp(
+            dir=STATUS_FILE.parent, prefix=STATUS_FILE.name + ".", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+            os.replace(tmp, STATUS_FILE)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:
+        print(f"[{TICKER}] failed to write status file: {exc}")
+
+
+def _status_snapshot(df):
+    """Indicator state on the last closed bar, for the status file."""
+    try:
+        curr = df.iloc[-1]
+        fast, mid, slow = (_finite(curr.get(c)) for c in ("ema_fast", "ema_mid", "ema_slow"))
+        if None in (fast, mid, slow):
+            stack = None
+        elif fast > mid > slow:
+            stack = "bull"
+        elif fast < mid < slow:
+            stack = "bear"
+        else:
+            stack = "mixed"
+        return {
+            "close": _finite(curr.get("Close")),
+            "ema_fast": fast,
+            "ema_mid": mid,
+            "ema_slow": slow,
+            "atr": _finite(curr.get("atr")),
+            "stack": stack,
+            "long_depth": int(curr.get("long_depth", 0)),
+            "short_depth": int(curr.get("short_depth", 0)),
+            "long_vetoed": bool(curr.get("long_vetoed", False)),
+            "short_vetoed": bool(curr.get("short_vetoed", False)),
+        }
+    except Exception as exc:
+        print(f"[{TICKER}] failed to snapshot indicators for status: {exc}")
+        return {}
 
 
 def _clip01(x):
@@ -743,15 +835,45 @@ def bars_since(df, bar_time):
     return int((df.index > ts).sum())
 
 
+# Polls in a row that raised. Reset by any poll that completes.
+_consecutive_errors = 0
+
+
 def run_once():
+    """One poll. Records its outcome to STATUS_FILE however it ends."""
+    global _consecutive_errors
+    status = {}
+    try:
+        status["result"] = _poll(status)
+    except Exception as exc:
+        _consecutive_errors += 1
+        status.update(
+            result="error", last_poll_ok=False,
+            last_error=_redact(f"{type(exc).__name__}: {exc}"),
+        )
+        raise
+    else:
+        _consecutive_errors = 0
+        status.update(last_poll_ok=True, last_error=None)
+    finally:
+        write_status(consecutive_errors=_consecutive_errors, **status)
+
+
+def _poll(status):
+    """
+    Fetch, evaluate, alert. Returns what happened: no_data, warmup, no_setup,
+    suppressed, refused or sent. Fills `status` with what it saw on the way.
+    """
     end = pd.Timestamp.now(tz="UTC")
     start = end - pd.Timedelta(minutes=interval_minutes(LOOKBACK))
     df = fetch_candles(TICKER, oanda_granularity(), start, end)
     if df.empty:
         print(f"[{TICKER}] no data returned this cycle, skipping")
-        return
+        return "no_data"
 
     df = drop_unclosed_bar(df)
+    status["bars_loaded"] = len(df)
+    status["last_bar_time"] = str(df.index[-1]) if len(df) else None
 
     if len(df) < MIN_BARS:
         print(
@@ -759,9 +881,10 @@ def run_once():
             f"EMA{EMA_SLOW} - widen SIGNAL_LOOKBACK (currently {LOOKBACK}) "
             f"or use a coarser SIGNAL_INTERVAL"
         )
-        return
+        return "warmup"
 
     df = compute_indicators(df)
+    status.update(_status_snapshot(df))
     signal, strength, tier, depth, reason = detect_signal(df)
 
     last = load_last_signal()
@@ -770,7 +893,7 @@ def run_once():
 
     if signal is None:
         print(f"[{TICKER}] no setup on the last closed bar (last sent: {last_tier} {last_signal})")
-        return
+        return "no_setup"
 
     # An opposite signal always goes through. A same-direction one is a fresh
     # setup once COOLDOWN_BARS have closed since the last alert -- the same
@@ -783,13 +906,13 @@ def run_once():
             # Polled again before the next bar closed: this is the bar the
             # stored alert was for.
             print(f"[{TICKER}] {tier} {signal} already sent for this bar, nothing new")
-            return
+            return "suppressed"
         if elapsed is not None and elapsed < COOLDOWN_BARS:
             print(
                 f"[{TICKER}] {tier} {signal} suppressed, only {elapsed} bars "
                 f"since the last one (cooldown {COOLDOWN_BARS})"
             )
-            return
+            return "suppressed"
 
     latest = df.iloc[-1]
     levels = build_sl_tp(
@@ -800,7 +923,7 @@ def run_once():
             f"[{TICKER}] {tier} {signal} skipped: stop would sit on the wrong side "
             f"of entry (price {latest['Close']:.2f}, depth {depth})"
         )
-        return
+        return "refused"
 
     sl, tp, rr, risk = levels
     send_discord_alert(
@@ -812,6 +935,7 @@ def run_once():
         f"[{TICKER}] sent {tier} {signal} alert @ {latest['Close']:.2f} "
         f"(depth {depth}, strength {strength:.2f}, risk {risk:.2f})"
     )
+    return "sent"
 
 
 if __name__ == "__main__":

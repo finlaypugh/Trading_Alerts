@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signal Bot</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1 id="title">Signal bot</h1>
+      <p class="muted" id="subtitle">loading…</p>
+    </div>
+    <span class="badge" id="health" data-health="no_data">…</span>
+  </header>
+  <p class="banner" id="banner" hidden></p>
+
+  <section class="card">
+    <h2>Market</h2>
+    <dl class="grid">
+      <dt>Close</dt><dd id="close">–</dd>
+      <dt>Stack</dt><dd id="stack">–</dd>
+      <dt id="ema_fast_label">EMA fast</dt><dd id="ema_fast">–</dd>
+      <dt id="ema_mid_label">EMA mid</dt><dd id="ema_mid">–</dd>
+      <dt id="ema_slow_label">EMA slow</dt><dd id="ema_slow">–</dd>
+      <dt>ATR</dt><dd id="atr">–</dd>
+      <dt>Long pullback</dt><dd id="long_pullback">–</dd>
+      <dt>Short pullback</dt><dd id="short_pullback">–</dd>
+      <dt>Last bar</dt><dd id="last_bar_time">–</dd>
+    </dl>
+  </section>
+
+  <section class="card">
+    <h2>Last poll</h2>
+    <dl class="grid">
+      <dt>When</dt><dd id="poll_age">–</dd>
+      <dt>Result</dt><dd id="result">–</dd>
+      <dt>Bars loaded</dt><dd id="bars_loaded">–</dd>
+      <dt>Errors in a row</dt><dd id="consecutive_errors">–</dd>
+      <dt>Last error</dt><dd id="last_error" class="wrap">–</dd>
+    </dl>
+  </section>
+
+  <section class="card">
+    <h2>Last alert</h2>
+    <p id="last_signal" class="big">–</p>
+    <p id="last_signal_detail" class="muted"></p>
+  </section>
+
+  <section class="card">
+    <h2>Quick commands</h2>
+    {% if actions_enabled %}
+    <form id="token_form" class="token">
+      <input id="token_input" type="password" autocomplete="off" placeholder="Action token" aria-label="Action token">
+      <button type="submit">Save</button>
+    </form>
+    <p class="muted small" id="token_state"></p>
+    {% else %}
+    <p class="muted">Actions are disabled: set <code>DASHBOARD_TOKEN</code> and restart the dashboard.</p>
+    {% endif %}
+    <div class="buttons">
+      {% for a in actions %}
+      <button type="button" data-action="{{ a.name }}"{% if a.confirm %} data-confirm="1" class="danger"{% endif %}
+              {% if not actions_enabled %}disabled title="DASHBOARD_TOKEN is not set"
+              {% elif not a.supported %}disabled title="Needs systemd (Linux)"{% endif %}>{{ a.label }}</button>
+      {% endfor %}
+    </div>
+    <pre id="action_output" hidden></pre>
+  </section>
+
+  <section class="card">
+    <h2>Log <span class="muted small" id="log_source"></span></h2>
+    <pre id="logs">–</pre>
+  </section>
+
+  <section class="card">
+    <details>
+      <summary>Config</summary>
+      <dl class="grid" id="config"></dl>
+    </details>
+  </section>
+</main>
+</body>
+</html>

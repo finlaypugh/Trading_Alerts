@@ -35,6 +35,58 @@ Tests:
 pip install pytest && pytest -v
 ```
 
+## Dashboard
+
+A small web page for any device on the home network: health, price and EMA
+stack, pullback state, last alert, log tail, and a fixed set of buttons. It
+is a separate process that only reads the bot's files, so stopping or
+crashing it never stops alerts.
+
+```bash
+# .env: DASHBOARD_TOKEN=<python -c "import secrets; print(secrets.token_urlsafe(24))">
+./run_dashboard.sh        # or run_dashboard.bat; then http://localhost:8080
+```
+
+On a Pi, run the bot and the dashboard as two systemd services:
+
+```bash
+sudo cp deploy/signal-bot.service deploy/dashboard.service /etc/systemd/system/
+sudo install -m 0440 deploy/sudoers-signal-bot /etc/sudoers.d/signal-bot && sudo visudo -c
+sudo usermod -aG systemd-journal pi       # lets the dashboard read the bot's log
+sudo systemctl daemon-reload
+sudo systemctl enable --now signal-bot dashboard
+```
+
+Then open `http://<pi-ip>:8080` from a phone or laptop on the same network.
+The units assume user `pi` and `/home/pi/Trading_Alerts`; edit them (and the
+sudoers file) if yours differ. If the bot runs under PM2 instead, the
+start/stop/restart buttons will fail; set `DASHBOARD_LOG_FILE` to the PM2 log
+for the log panel.
+
+| Button | Does | Confirm |
+|---|---|---|
+| Send test alert | Posts a labelled test message to Discord | no |
+| Poll now | Runs one `run_once()` in a subprocess. Can send a real alert. | no |
+| Start / Restart / Stop bot | `sudo -n /bin/systemctl <verb> signal-bot`. Linux only. | restart, stop |
+| Clear last signal | Deletes `.state_<ticker>.json`: resets cooldown | yes |
+| Update dependencies | `pip install -r requirements.txt` in the venv | yes |
+
+Health comes from `.status_<ticker>.json`, which the bot rewrites after
+every poll: **ok**, **error** (last poll raised), **stale** (no poll for 2×
+`SIGNAL_POLL_SECONDS`), **down** (10×), **no data** (no file yet).
+
+Security:
+
+- Reads are open to the LAN. Every button needs `DASHBOARD_TOKEN`, entered
+  once per browser tab; with it unset, all actions are refused.
+- Actions are a fixed whitelist: no shell, one at a time, 10 a minute per IP,
+  each logged with the client IP. Cross-origin POSTs are rejected.
+- The webhook URL and API tokens are kept out of every response, logs and
+  errors included.
+- It is plain HTTP. **Do not port-forward it.** For access away from home,
+  use [Tailscale](https://tailscale.com) and open
+  `http://<pi-tailscale-name>:8080`.
+
 ## The strategy
 
 Stated the way the source material states it:
@@ -187,6 +239,10 @@ is the annotated copy; this table is the complete list.
 | `SIGNAL_COOLDOWN_BARS` | `4` | Minimum bars between same-direction alerts. |
 | `SIGNAL_WEAK_STRENGTH_CAP` | `0.5` | Ceiling on a WEAK alert's strength score. |
 | `SIGNAL_POLL_SECONDS` | `30` | Seconds between polls. Must be shorter than one bar, or bars get skipped. |
+| `DASHBOARD_TOKEN` | — | Enables the dashboard's buttons. Unset = read-only. |
+| `DASHBOARD_HOST` | `0.0.0.0` | Dashboard bind address. |
+| `DASHBOARD_PORT` | `8080` | Dashboard port. |
+| `DASHBOARD_LOG_FILE` | — | Log file for the dashboard's log panel. Unset = `journalctl -u signal-bot`. |
 
 Alerts are throttled by state in `.state_<ticker>.json`: an opposite-direction
 signal always goes through, a same-direction one waits `SIGNAL_COOLDOWN_BARS`
