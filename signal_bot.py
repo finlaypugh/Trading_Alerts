@@ -65,6 +65,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pandas as pd
 import requests
@@ -307,9 +308,17 @@ def _finite(x):
 
 
 def _redact(text):
-    """Strip the webhook URL out of text bound for the status file."""
+    """Strip the webhook URL out of text bound for the status file.
+
+    Connection errors carry only its path ("... with url: /api/webhooks/<id>/
+    <token>"), so the path is stripped too.
+    """
     text = str(text)
-    return text.replace(DISCORD_WEBHOOK_URL, "<webhook>") if DISCORD_WEBHOOK_URL else text
+    if not DISCORD_WEBHOOK_URL:
+        return text
+    text = text.replace(DISCORD_WEBHOOK_URL, "<webhook>")
+    path = urlsplit(DISCORD_WEBHOOK_URL).path
+    return text.replace(path, "<webhook>") if len(path) > 1 else text
 
 
 def write_status(**fields):

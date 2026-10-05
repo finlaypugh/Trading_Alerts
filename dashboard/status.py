@@ -60,7 +60,11 @@ CONFIG_KEYS = {
 }
 
 SECRET_ENV = ("DISCORD_WEBHOOK_URL", "OANDA_API_TOKEN", "DASHBOARD_TOKEN")
-WEBHOOK_RE = re.compile(r"https?://[\w.-]*discord(?:app)?\.com/api/webhooks/\S+", re.I)
+# Scheme and host optional: urllib3 connection errors quote only the path,
+# "Max retries exceeded with url: /api/webhooks/<id>/<token>".
+WEBHOOK_RE = re.compile(
+    r"(?:https?://[\w.-]*discord(?:app)?\.com)?/api/webhooks/[\w-]+(?:/[\w-]+)?", re.I
+)
 REDACTED = "<redacted>"
 
 

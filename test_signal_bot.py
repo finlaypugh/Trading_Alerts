@@ -1197,6 +1197,23 @@ class TestRunOnceStatus:
         assert signal_bot.DISCORD_WEBHOOK_URL not in signal_bot.STATUS_FILE.read_text()
         assert "<webhook>" in read_status()["last_error"]
 
+    def test_webhook_path_from_a_connection_error_is_redacted(self, run_once_env, monkeypatch):
+        # urllib3 quotes only the path: "Max retries exceeded with url: /api/webhooks/..."
+        monkeypatch.setattr(signal_bot, "DISCORD_WEBHOOK_URL",
+                            "https://discord.com/api/webhooks/123/SECRET-token")
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+
+        def boom(*a, **k):
+            raise signal_bot.requests.ConnectionError(
+                "HTTPSConnectionPool(host='discord.com', port=443): Max retries exceeded "
+                "with url: /api/webhooks/123/SECRET-token (Caused by NameResolutionError)"
+            )
+
+        monkeypatch.setattr(signal_bot, "send_discord_alert", boom)
+        with pytest.raises(signal_bot.requests.ConnectionError):
+            signal_bot.run_once()
+        assert "SECRET-token" not in signal_bot.STATUS_FILE.read_text()
+
     def test_a_status_write_failure_does_not_break_the_poll(
         self, run_once_env, monkeypatch, tmp_path
     ):

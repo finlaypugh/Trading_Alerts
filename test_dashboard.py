@@ -183,6 +183,13 @@ class TestSecrets:
         other = "https://canary.discordapp.com/api/webhooks/1/abcdef"
         assert "abcdef" not in status.redact(f"failed: {other}")
 
+    def test_path_only_webhook_from_a_connection_error_is_redacted(self):
+        # urllib3 quotes only the path when the host is unreachable.
+        text = ("HTTPSConnectionPool(host='discord.com', port=443): Max retries exceeded "
+                "with url: /api/webhooks/123/SECRET-tok_en (Caused by NameResolutionError)")
+        assert "SECRET-tok_en" not in status.redact(text)
+        assert "(Caused by NameResolutionError)" in status.redact(text)
+
     def test_secret_env_values_are_redacted(self, monkeypatch):
         monkeypatch.setenv("OANDA_API_TOKEN", "oanda-secret-123")
         assert "oanda-secret-123" not in status.redact("Bearer oanda-secret-123")
