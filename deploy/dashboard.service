@@ -1,5 +1,4 @@
-# Install: sudo cp deploy/dashboard.service /etc/systemd/system/
-# Edit User and paths if not pi / /home/pi/Trading_Alerts.
+# Install with deploy/install.sh, which fills in User= and the paths
 # No Requires=/BindsTo= on signal-bot: either can die without the other.
 # No NoNewPrivileges=: the restart/stop/start buttons need sudo.
 [Unit]

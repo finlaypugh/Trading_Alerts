@@ -50,16 +50,14 @@ crashing it never stops alerts.
 On a Pi, run the bot and the dashboard as two systemd services:
 
 ```bash
-sudo cp deploy/signal-bot.service deploy/dashboard.service /etc/systemd/system/
-sudo install -m 0440 deploy/sudoers-signal-bot /etc/sudoers.d/signal-bot && sudo visudo -c
-sudo usermod -aG systemd-journal pi       # lets the dashboard read the bot's log
-sudo systemctl daemon-reload
+./deploy/install.sh       # as your normal user, not sudo
 sudo systemctl enable --now signal-bot dashboard
 ```
 
-Then open `http://<pi-ip>:8080` from a phone or laptop on the same network.
-The units assume user `pi` and `/home/pi/Trading_Alerts`; edit them (and the
-sudoers file) if yours differ. If the bot runs under PM2 instead, the
+`install.sh` installs both units and the sudoers rule for the user running it
+and this checkout's path, and adds that user to `systemd-journal` for the log
+panel. Then open `http://<pi-ip>:8080` from a phone or laptop on the same
+network. If the bot runs under PM2 instead, the
 start/stop/restart buttons will fail; set `DASHBOARD_LOG_FILE` to the PM2 log
 for the log panel.
 
