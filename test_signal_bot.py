@@ -18,6 +18,7 @@ import pandas as pd
 import pytest
 
 import signal_bot
+from dashboard import status as dashboard_status
 
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1223,192 @@ class TestRunOnceStatus:
         signal_bot.run_once()
         assert len(run_once_env.sent) == 1
         assert signal_bot.load_last_signal()["signal"] == "BUY"
+
+
+# ---------------------------------------------------------------------------
+# Bars and alert log (read by dashboard/)
+# ---------------------------------------------------------------------------
+
+def read_bars():
+    return json.loads(signal_bot.BARS_FILE.read_text())
+
+
+def read_alerts():
+    return [json.loads(line) for line in signal_bot.ALERTS_FILE.read_text().splitlines()]
+
+
+def ohlc_indicator_frame(n, start="2026-01-05 00:00"):
+    df = make_ohlc_df([100.0 + i for i in range(n)], index=bars(n, start=start))
+    df["Open"] = df["Close"]
+    df["ema_fast"] = df["Close"] - 1
+    df["ema_mid"] = df["Close"] - 2
+    df["ema_slow"] = df["Close"] - 3
+    df["green_arrow"] = False
+    df["red_arrow"] = False
+    df.iloc[-1, df.columns.get_loc("green_arrow")] = True
+    return df
+
+
+class TestWriteBars:
+    def test_writes_the_last_n_bars_with_indicators(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "DASHBOARD_BARS", 5)
+        df = ohlc_indicator_frame(20)
+        signal_bot.write_bars(df)
+        data = read_bars()
+        assert data["ticker"] == signal_bot.TICKER
+        assert data["interval"] == signal_bot.INTERVAL
+        assert len(data["bars"]) == 5
+        last = data["bars"][-1]
+        assert last["time"] == str(df.index[-1])
+        assert last["close"] == 119.0
+        assert last["high"] == 120.0
+        assert last["ema_slow"] == 116.0
+        assert last["green_arrow"] is True
+        assert data["bars"][0]["green_arrow"] is False
+
+    def test_skips_the_write_until_a_new_bar_closes(self, monkeypatch):
+        writes = []
+        real = signal_bot._atomic_write
+        monkeypatch.setattr(
+            signal_bot, "_atomic_write", lambda p, t: writes.append(p) or real(p, t)
+        )
+        df = ohlc_indicator_frame(10)
+        signal_bot.write_bars(df)
+        signal_bot.write_bars(df)
+        assert len(writes) == 1
+        signal_bot.write_bars(ohlc_indicator_frame(11))
+        assert len(writes) == 2
+
+    def test_rewrites_if_the_file_was_removed(self):
+        df = ohlc_indicator_frame(10)
+        signal_bot.write_bars(df)
+        signal_bot.BARS_FILE.unlink()
+        signal_bot.write_bars(df)
+        assert signal_bot.BARS_FILE.exists()
+
+    def test_nan_and_missing_columns_become_null(self):
+        df = make_signal_df(3, {"Close": 101.0, "atr": float("nan")})
+        df["ema_fast"] = float("nan")
+        signal_bot.write_bars(df)
+        text = signal_bot.BARS_FILE.read_text()
+        assert "NaN" not in text
+        last = read_bars()["bars"][-1]
+        assert last["ema_fast"] is None
+        assert last["open"] is None
+        assert last["close"] == 101.0
+
+    def test_failure_does_not_raise_and_retries_next_poll(self, monkeypatch, tmp_path):
+        good = signal_bot.BARS_FILE
+        signal_bot.write_bars(ohlc_indicator_frame(10))
+        newer = ohlc_indicator_frame(11)
+
+        monkeypatch.setattr(signal_bot, "BARS_FILE", tmp_path / "missing" / "bars.json")
+        signal_bot.write_bars(newer)
+        # The failed bar must not be remembered as written...
+        assert signal_bot._bars_written_for == str(newer.index[-2])
+
+        # ...so the next poll of the same bar writes it.
+        monkeypatch.setattr(signal_bot, "BARS_FILE", good)
+        signal_bot.write_bars(newer)
+        assert read_bars()["bars"][-1]["time"] == str(newer.index[-1])
+
+    def test_writes_exactly_the_fields_the_dashboard_reads(self):
+        signal_bot.write_bars(ohlc_indicator_frame(3))
+        for row in read_bars()["bars"]:
+            assert set(row) == set(dashboard_status.BAR_FIELDS)
+
+    def test_run_once_writes_bars(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", lambda df: (None, 0.0, None, 0, ""))
+        signal_bot.run_once()
+        assert read_bars()["bars"][-1]["time"] == str(run_once_env.index[-1])
+
+    def test_a_bars_write_failure_does_not_break_the_poll(
+        self, run_once_env, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(signal_bot, "BARS_FILE", tmp_path / "missing" / "bars.json")
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
+        assert read_status()["result"] == "sent"
+
+
+class TestAppendAlert:
+    def test_appends_one_line_per_alert(self):
+        signal_bot.append_alert(signal="BUY", price=1.5)
+        signal_bot.append_alert(signal="SELL", price=2.5)
+        alerts = read_alerts()
+        assert [a["signal"] for a in alerts] == ["BUY", "SELL"]
+        assert alerts[0]["sent_utc"].endswith("+00:00")
+
+    def test_keeps_only_the_newest(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "ALERTS_KEEP", 3)
+        for i in range(5):
+            signal_bot.append_alert(price=float(i))
+        assert [a["price"] for a in read_alerts()] == [2.0, 3.0, 4.0]
+
+    def test_webhook_is_redacted_from_text_fields(self):
+        signal_bot.append_alert(reason=f"posted to {signal_bot.DISCORD_WEBHOOK_URL}")
+        assert signal_bot.DISCORD_WEBHOOK_URL not in signal_bot.ALERTS_FILE.read_text()
+
+    def test_failure_does_not_raise(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(signal_bot, "ALERTS_FILE", tmp_path / "missing" / "a.jsonl")
+        signal_bot.append_alert(signal="BUY")
+
+    def test_run_once_logs_a_sent_alert_with_its_levels(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        (alert,) = read_alerts()
+        assert alert["signal"] == "BUY"
+        assert alert["tier"] == "STRONG"
+        assert alert["depth"] == 1
+        assert alert["strength"] == 0.8
+        assert alert["bar_time"] == str(run_once_env.index[-1])
+        assert alert["price"] == 112.0
+        assert alert["sl"] < alert["price"] < alert["tp"]
+        assert alert["rr"] == signal_bot.RR
+        assert alert["reason"] == "test reason"
+
+    def test_run_once_logs_exactly_the_fields_the_dashboard_reads(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        (alert,) = read_alerts()
+        assert set(alert) == set(dashboard_status.ALERT_FIELDS)
+
+    def test_a_failed_alert_log_does_not_cause_a_resend(
+        self, run_once_env, monkeypatch, tmp_path
+    ):
+        # append_alert sits between the Discord send and save_last_signal. If
+        # it raised there, state would never be saved and every later poll
+        # would send the same alert again.
+        monkeypatch.setattr(signal_bot, "ALERTS_FILE", tmp_path / "missing" / "a.jsonl")
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
+        assert read_status()["result"] == "sent"
+        assert signal_bot.load_last_signal()["signal"] == "BUY"
+
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
+        assert read_status()["result"] == "suppressed"
+
+    @pytest.mark.parametrize("setup", ["no_setup", "suppressed", "refused", "send_fails"])
+    def test_run_once_logs_nothing_unless_sent(self, setup, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        if setup == "no_setup":
+            monkeypatch.setattr(signal_bot, "detect_signal", lambda df: (None, 0.0, None, 0, ""))
+        elif setup == "suppressed":
+            signal_bot.save_last_signal("BUY", "STRONG", 1, str(run_once_env.index[-3]))
+        elif setup == "refused":
+            run_once_env.curr = TestRunOnceRefusedTrades.WRONG_SIDE
+        else:
+            def boom(*a, **k):
+                raise signal_bot.requests.HTTPError("503 from Discord")
+            monkeypatch.setattr(signal_bot, "send_discord_alert", boom)
+        try:
+            signal_bot.run_once()
+        except signal_bot.requests.HTTPError:
+            pass
+        assert not signal_bot.ALERTS_FILE.exists()
 
 
 class TestOandaGranularity:

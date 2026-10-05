@@ -149,6 +149,12 @@ WEAK_STRENGTH_CAP = float(os.environ.get("SIGNAL_WEAK_STRENGTH_CAP", 0.5))
 STATE_FILE = Path(__file__).parent / f".state_{TICKER.replace('/', '_')}.json"
 # Rewritten after every poll for dashboard/. Read-only to everything else.
 STATUS_FILE = Path(__file__).parent / f".status_{TICKER.replace('/', '_')}.json"
+# Recent bars with their indicators, rewritten once per new closed bar, and an
+# append-only log of every alert sent. Both exist only for dashboard/.
+BARS_FILE = Path(__file__).parent / f".bars_{TICKER.replace('/', '_')}.json"
+ALERTS_FILE = Path(__file__).parent / f".alerts_{TICKER.replace('/', '_')}.jsonl"
+DASHBOARD_BARS = int(os.environ.get("DASHBOARD_BARS", 200))
+ALERTS_KEEP = 500
 
 # Enough history for the slowest EMA to settle, plus a full fractal window
 # (n bars either side of a pivot, plus the n-bar confirmation delay).
@@ -321,12 +327,29 @@ def _redact(text):
     return text.replace(path, "<webhook>") if len(path) > 1 else text
 
 
+def _atomic_write(path, text):
+    """
+    Replace path with text via a temp file in the same directory and
+    os.replace, so a reader never sees half a file. Raises on failure, after
+    removing the temp file.
+    """
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def write_status(**fields):
     """
     Atomically replace STATUS_FILE with this poll's outcome, for the dashboard.
-    Written to a temp file in the same directory, then os.replace'd, so a
-    reader never sees half a file. Never raises: a status failure must not
-    cost a poll.
+    Never raises: a status failure must not cost a poll.
     """
     try:
         payload = {
@@ -336,22 +359,77 @@ def write_status(**fields):
             "poll_seconds": POLL_SECONDS,
             **fields,
         }
-        text = json.dumps(payload, default=str, allow_nan=False)
-        fd, tmp = tempfile.mkstemp(
-            dir=STATUS_FILE.parent, prefix=STATUS_FILE.name + ".", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w") as f:
-                f.write(text)
-            os.replace(tmp, STATUS_FILE)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        _atomic_write(STATUS_FILE, json.dumps(payload, default=str, allow_nan=False))
     except Exception as exc:
         print(f"[{TICKER}] failed to write status file: {exc}")
+
+
+# Last bar BARS_FILE was written for. Polls land several times per bar; only
+# a newly closed bar changes the chart, so the rest skip the write.
+_bars_written_for = None
+
+BAR_COLUMNS = {
+    "open": "Open", "high": "High", "low": "Low", "close": "Close",
+    "ema_fast": "ema_fast", "ema_mid": "ema_mid", "ema_slow": "ema_slow",
+}
+
+
+def write_bars(df):
+    """
+    Atomically replace BARS_FILE with the last DASHBOARD_BARS bars of an
+    indicator frame, for the dashboard chart. Skipped when the last bar has
+    not changed since the previous write. Never raises.
+    """
+    global _bars_written_for
+    try:
+        if not len(df):
+            return
+        last = str(df.index[-1])
+        if last == _bars_written_for and BARS_FILE.exists():
+            return
+        tail = df.iloc[-DASHBOARD_BARS:]
+        rows = []
+        for when, row in tail.iterrows():
+            bar = {"time": str(when)}
+            for key, col in BAR_COLUMNS.items():
+                bar[key] = _finite(row.get(col))
+            bar["green_arrow"] = bool(row.get("green_arrow", False))
+            bar["red_arrow"] = bool(row.get("red_arrow", False))
+            rows.append(bar)
+        payload = {
+            "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ticker": TICKER,
+            "interval": INTERVAL,
+            "bars": rows,
+        }
+        _atomic_write(BARS_FILE, json.dumps(payload, default=str, allow_nan=False))
+        _bars_written_for = last
+    except Exception as exc:
+        print(f"[{TICKER}] failed to write bars file: {type(exc).__name__}: {exc}")
+
+
+def append_alert(**fields):
+    """
+    Add one sent alert to ALERTS_FILE, keeping the newest ALERTS_KEEP lines.
+    Rewritten atomically rather than opened for append, so the cap holds and
+    a crash mid-write cannot leave a torn last line. Never raises.
+    """
+    try:
+        record = {
+            "sent_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            **{k: _redact(v) if isinstance(v, str) else v for k, v in fields.items()},
+        }
+        try:
+            lines = ALERTS_FILE.read_text().splitlines()
+        except FileNotFoundError:
+            lines = []
+        lines.append(json.dumps(record, default=str, allow_nan=False))
+        _atomic_write(ALERTS_FILE, "\n".join(lines[-ALERTS_KEEP:]) + "\n")
+    except Exception as exc:
+        print(
+            f"[{TICKER}] failed to log {fields.get('signal')} alert for bar "
+            f"{fields.get('bar_time')} to the alert history: {type(exc).__name__}: {exc}"
+        )
 
 
 def _status_snapshot(df):
@@ -885,6 +963,7 @@ def _poll(status):
 
     df = compute_indicators(df)
     status.update(_status_snapshot(df))
+    write_bars(df)
     signal, strength, tier, depth, reason = detect_signal(df)
 
     last = load_last_signal()
@@ -929,6 +1008,11 @@ def _poll(status):
     send_discord_alert(
         signal, latest["Close"], latest["atr"], strength, tier, depth, reason,
         latest["ema_fast"], latest["ema_mid"], latest["ema_slow"], sl, tp, rr,
+    )
+    append_alert(
+        bar_time=str(df.index[-1]), signal=signal, tier=tier, depth=int(depth),
+        strength=_finite(strength), price=_finite(latest["Close"]),
+        sl=_finite(sl), tp=_finite(tp), rr=_finite(rr), risk=_finite(risk), reason=reason,
     )
     save_last_signal(signal, tier, depth, df.index[-1])
     print(

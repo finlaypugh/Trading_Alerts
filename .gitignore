@@ -4,5 +4,7 @@ __pycache__/
 *.pyc
 .state_*.json
 .status_*
+.bars_*
+.alerts_*
 .idea/
 .pytest_cache/

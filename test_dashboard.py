@@ -159,6 +159,130 @@ class TestLastSignal:
 
 
 # ---------------------------------------------------------------------------
+# Chart bars and alert history
+# ---------------------------------------------------------------------------
+
+def write_bars(bars, **fields):
+    payload = {"ticker": "TESTTICKER", "interval": "1m", "bars": bars}
+    payload.update(fields)
+    status.bars_path().write_text(json.dumps(payload))
+
+
+def bar(time="2026-10-05 11:59:00+00:00", **fields):
+    row = {"time": time, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5,
+           "ema_fast": 1.4, "ema_mid": 1.3, "ema_slow": 1.2,
+           "green_arrow": False, "red_arrow": False}
+    row.update(fields)
+    return row
+
+
+def write_alerts(*records):
+    status.alerts_path().write_text(
+        "".join((r if isinstance(r, str) else json.dumps(r)) + "\n" for r in records)
+    )
+
+
+class TestBars:
+    def test_missing_file(self, client):
+        resp = client.get("/api/bars")
+        assert resp.status_code == 200
+        assert resp.json["bars"] == []
+        assert "no bars yet" in resp.json["message"]
+
+    @pytest.mark.parametrize("text", ["{oops", "[1]", '{"bars": "x"}'])
+    def test_corrupt_or_wrong_shape(self, client, text):
+        status.bars_path().write_text(text)
+        resp = client.get("/api/bars")
+        assert resp.status_code == 200
+        assert resp.json["bars"] == []
+        assert resp.json["message"]
+
+    def test_adds_unix_time_and_keeps_order(self, client):
+        write_bars([bar("2026-10-05 11:58:00+00:00"), bar("2026-10-05 11:59:00+00:00")])
+        data = client.get("/api/bars").json
+        assert data["message"] is None
+        assert data["interval"] == "1m"
+        assert [b["ts"] for b in data["bars"]] == [
+            int(datetime(2026, 10, 5, 11, 58, tzinfo=timezone.utc).timestamp()),
+            int(datetime(2026, 10, 5, 11, 59, tzinfo=timezone.utc).timestamp()),
+        ]
+
+    def test_naive_times_are_utc(self, client):
+        write_bars([bar("2026-10-05 11:59:00")])
+        ts = client.get("/api/bars").json["bars"][0]["ts"]
+        assert ts == int(datetime(2026, 10, 5, 11, 59, tzinfo=timezone.utc).timestamp())
+
+    def test_bad_rows_are_skipped(self, client):
+        write_bars([bar(), "junk", bar(time="whenever"), bar(time=None)])
+        assert len(client.get("/api/bars").json["bars"]) == 1
+
+    def test_unknown_fields_are_dropped(self, client):
+        write_bars([bar(surprise="hello")])
+        assert "surprise" not in client.get("/api/bars").json["bars"][0]
+
+    def test_reads_what_the_bot_writes(self, client, monkeypatch):
+        import pandas as pd
+        monkeypatch.setattr(signal_bot, "BARS_FILE", status.bars_path())
+        monkeypatch.setattr(signal_bot, "_bars_written_for", None)
+        idx = pd.date_range("2026-10-05 11:50", periods=3, freq="1min", tz="UTC")
+        df = pd.DataFrame({"Open": 1.0, "High": 2.0, "Low": 0.5, "Close": [1.0, 1.1, 1.2],
+                           "ema_fast": 1.0, "ema_mid": 0.9, "ema_slow": float("nan"),
+                           "green_arrow": [False, True, False], "red_arrow": False},
+                          index=idx)
+        signal_bot.write_bars(df)
+        bars = client.get("/api/bars").json["bars"]
+        assert [b["close"] for b in bars] == [1.0, 1.1, 1.2]
+        assert bars[1]["green_arrow"] is True
+        assert bars[0]["ema_slow"] is None
+        assert bars[-1]["ts"] == int(idx[-1].timestamp())
+
+
+class TestAlerts:
+    ALERT = {"sent_utc": "2026-10-05T12:00:01+00:00", "bar_time": "2026-10-05 11:59:00+00:00",
+             "signal": "BUY", "tier": "STRONG", "depth": 1, "strength": 0.8,
+             "price": 10.0, "sl": 9.0, "tp": 11.5, "rr": 1.5, "risk": 1.0, "reason": "r"}
+
+    def test_missing_file(self, client):
+        resp = client.get("/api/alerts")
+        assert resp.status_code == 200
+        assert resp.json["alerts"] == []
+        assert resp.json["message"] == "no alerts logged yet"
+
+    def test_newest_first_with_unix_time(self, client):
+        write_alerts(dict(self.ALERT, price=1.0), dict(self.ALERT, price=2.0))
+        alerts = client.get("/api/alerts").json["alerts"]
+        assert [a["price"] for a in alerts] == [2.0, 1.0]
+        assert alerts[0]["ts"] == int(
+            datetime(2026, 10, 5, 11, 59, tzinfo=timezone.utc).timestamp()
+        )
+        assert alerts[0]["sl"] == 9.0
+
+    def test_n_limits_and_is_clamped(self, client):
+        write_alerts(*[dict(self.ALERT, price=float(i)) for i in range(5)])
+        assert [a["price"] for a in client.get("/api/alerts?n=2").json["alerts"]] == [4.0, 3.0]
+        assert len(client.get("/api/alerts?n=0").json["alerts"]) == 1
+        assert len(client.get("/api/alerts?n=99999").json["alerts"]) == 5
+
+    def test_bad_lines_are_skipped_and_counted(self, client):
+        write_alerts(self.ALERT, "{torn", "[1]", self.ALERT)
+        data = client.get("/api/alerts").json
+        assert len(data["alerts"]) == 2
+        assert data["skipped"] == 2
+
+    def test_unknown_fields_are_dropped(self, client):
+        write_alerts(dict(self.ALERT, surprise="hello"))
+        assert "surprise" not in client.get("/api/alerts").json["alerts"][0]
+
+    def test_reads_what_the_bot_writes(self, client, monkeypatch):
+        monkeypatch.setattr(signal_bot, "ALERTS_FILE", status.alerts_path())
+        signal_bot.append_alert(bar_time="2026-10-05 11:59:00+00:00", signal="SELL", sl=2.0)
+        (alert,) = client.get("/api/alerts").json["alerts"]
+        assert alert["signal"] == "SELL"
+        assert alert["sl"] == 2.0
+        assert alert["sent_utc"]
+
+
+# ---------------------------------------------------------------------------
 # Secrets
 # ---------------------------------------------------------------------------
 
@@ -202,10 +326,13 @@ class TestSecrets:
 
     @pytest.mark.parametrize("path", [
         "/", "/api/status", "/api/last-signal", "/api/config", "/api/logs", "/healthz",
+        "/api/bars", "/api/alerts",
     ])
     def test_webhook_appears_in_no_get_response(self, client, path, monkeypatch, tmp_path):
         write_status(last_error=SENTINEL)
         status.state_path().write_text(json.dumps({"signal": "BUY", "tier": SENTINEL}))
+        write_bars([bar()], ticker=SENTINEL)
+        write_alerts({"signal": "BUY", "reason": f"failed: {SENTINEL}", "tier": SENTINEL})
         log = tmp_path / "bot.log"
         log.write_text(SENTINEL + "\n")
         monkeypatch.setenv("DASHBOARD_LOG_FILE", str(log))
@@ -613,3 +740,14 @@ def test_index_renders(client):
     resp = client.get("/")
     assert resp.status_code == 200
     assert b"app.js" in resp.data
+
+
+def test_chart_library_is_served_locally(client):
+    html = client.get("/").get_data(as_text=True)
+    assert "/static/vendor/lightweight-charts.standalone.production.js" in html
+    assert "unpkg" not in html and "cdn" not in html
+    resp = client.get("/static/vendor/lightweight-charts.standalone.production.js")
+    assert resp.status_code == 200
+    assert resp.mimetype in ("text/javascript", "application/javascript")
+    assert b"Lightweight Charts" in resp.get_data()[:300]
+    resp.close()
