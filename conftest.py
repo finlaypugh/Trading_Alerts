@@ -18,8 +18,11 @@ os.environ.setdefault("DASHBOARD_TOKEN", "test-token")
 
 @pytest.fixture(autouse=True)
 def _isolate_status_file(tmp_path, monkeypatch):
-    """Every run_once() writes a status file; keep it out of the repo."""
+    """Every run_once() writes status and bars files; keep them out of the repo."""
     import signal_bot
 
     monkeypatch.setattr(signal_bot, "STATUS_FILE", tmp_path / ".status_TEST.json")
+    monkeypatch.setattr(signal_bot, "BARS_FILE", tmp_path / ".bars_TEST.json")
+    monkeypatch.setattr(signal_bot, "ALERTS_FILE", tmp_path / ".alerts_TEST.jsonl")
+    monkeypatch.setattr(signal_bot, "_bars_written_for", None)
     monkeypatch.setattr(signal_bot, "_consecutive_errors", 0)
