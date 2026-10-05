@@ -37,10 +37,23 @@ pip install pytest && pytest -v
 
 ## Dashboard
 
-A small web page for any device on the home network: health, price and EMA
-stack, pullback state, last alert, log tail, and a fixed set of buttons. It
-is a separate process that only reads the bot's files, so stopping or
-crashing it never stops alerts.
+A small web page for any device on the home network. It is a separate
+process that only reads the bot's files, so stopping or crashing it never
+stops alerts. It shows:
+
+- price, EMA stack and health in a header that stays on screen;
+- a candlestick chart of the last 200 closed bars with the three EMAs,
+  confirmed fractals, past alerts, and the newest alert's entry, stop and
+  target;
+- the setup strip: for each side, whether the stack is ordered, a pullback is
+  live (or vetoed), and the bot is armed for a fractal;
+- the last alert with its levels and strength, and an alert history table
+  (click a row to find it on the chart);
+- the last poll's outcome, a filterable log tail, the effective config, and
+  a fixed set of buttons.
+
+A new alert flashes the tab title and, if switched on with the Sound button,
+plays a chime. Browser notifications need HTTPS, which this is not.
 
 ```bash
 # .env: DASHBOARD_TOKEN=<python -c "import secrets; print(secrets.token_urlsafe(24))">
@@ -71,8 +84,13 @@ for the log panel.
 | Clear last signal | Deletes `.state_<ticker>.json`: resets cooldown | yes |
 | Update dependencies | `pip install -r requirements.txt` in the venv | yes |
 
-Health comes from `.status_<ticker>.json`, which the bot rewrites after
-every poll: **ok**, **error** (last poll raised), **stale** (no poll for 2×
+The bot writes three files for the dashboard next to its state file, all
+git-ignored: `.status_<ticker>.json` after every poll, `.bars_<ticker>.json`
+once per newly closed bar (`DASHBOARD_BARS`, default 200), and
+`.alerts_<ticker>.jsonl`, one line per sent alert, newest 500 kept. History
+starts when this version is deployed; Clear last signal does not erase it.
+
+Health comes from `.status_<ticker>.json`: **ok**, **error** (last poll raised), **stale** (no poll for 2×
 `SIGNAL_POLL_SECONDS`), **down** (10×), **no data** (no file yet).
 
 Security:

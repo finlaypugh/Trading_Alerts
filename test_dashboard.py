@@ -740,3 +740,14 @@ def test_index_renders(client):
     resp = client.get("/")
     assert resp.status_code == 200
     assert b"app.js" in resp.data
+
+
+def test_chart_library_is_served_locally(client):
+    html = client.get("/").get_data(as_text=True)
+    assert "/static/vendor/lightweight-charts.standalone.production.js" in html
+    assert "unpkg" not in html and "cdn" not in html
+    resp = client.get("/static/vendor/lightweight-charts.standalone.production.js")
+    assert resp.status_code == 200
+    assert resp.mimetype in ("text/javascript", "application/javascript")
+    assert b"Lightweight Charts" in resp.get_data()[:300]
+    resp.close()

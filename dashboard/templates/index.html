@@ -3,85 +3,180 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>Signal Bot</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<script src="{{ url_for('static', filename='vendor/lightweight-charts.standalone.production.js') }}" defer></script>
 <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </head>
 <body>
-<main>
-  <header>
-    <div>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="ident">
       <h1 id="title">Signal bot</h1>
-      <p class="muted" id="subtitle">loading…</p>
+      <p class="muted small" id="subtitle">loading…</p>
     </div>
-    <span class="badge" id="health" data-health="no_data">…</span>
-  </header>
-  <p class="banner" id="banner" hidden></p>
-
-  <section class="card">
-    <h2>Market</h2>
-    <dl class="grid">
-      <dt>Close</dt><dd id="close">–</dd>
-      <dt>Stack</dt><dd id="stack">–</dd>
-      <dt id="ema_fast_label">EMA fast</dt><dd id="ema_fast">–</dd>
-      <dt id="ema_mid_label">EMA mid</dt><dd id="ema_mid">–</dd>
-      <dt id="ema_slow_label">EMA slow</dt><dd id="ema_slow">–</dd>
-      <dt>ATR</dt><dd id="atr">–</dd>
-      <dt>Long pullback</dt><dd id="long_pullback">–</dd>
-      <dt>Short pullback</dt><dd id="short_pullback">–</dd>
-      <dt>Last bar</dt><dd id="last_bar_time">–</dd>
-    </dl>
-  </section>
-
-  <section class="card">
-    <h2>Last poll</h2>
-    <dl class="grid">
-      <dt>When</dt><dd id="poll_age">–</dd>
-      <dt>Result</dt><dd id="result">–</dd>
-      <dt>Bars loaded</dt><dd id="bars_loaded">–</dd>
-      <dt>Errors in a row</dt><dd id="consecutive_errors">–</dd>
-      <dt>Last error</dt><dd id="last_error" class="wrap">–</dd>
-    </dl>
-  </section>
-
-  <section class="card">
-    <h2>Last alert</h2>
-    <p id="last_signal" class="big">–</p>
-    <p id="last_signal_detail" class="muted"></p>
-  </section>
-
-  <section class="card">
-    <h2>Quick commands</h2>
-    {% if actions_enabled %}
-    <form id="token_form" class="token">
-      <input id="token_input" type="password" autocomplete="off" placeholder="Action token" aria-label="Action token">
-      <button type="submit">Save</button>
-    </form>
-    <p class="muted small" id="token_state"></p>
-    {% else %}
-    <p class="muted">Actions are disabled: set <code>DASHBOARD_TOKEN</code> and restart the dashboard.</p>
-    {% endif %}
-    <div class="buttons">
-      {% for a in actions %}
-      <button type="button" data-action="{{ a.name }}"{% if a.confirm %} data-confirm="1" class="danger"{% endif %}
-              {% if not actions_enabled %}disabled title="DASHBOARD_TOKEN is not set"
-              {% elif not a.supported %}disabled title="Needs systemd (Linux)"{% endif %}>{{ a.label }}</button>
-      {% endfor %}
+    <div class="quote">
+      <span class="price" id="hero_close">–</span>
+      <span class="chip" id="hero_stack" data-stack="">–</span>
     </div>
-    <pre id="action_output" hidden></pre>
-  </section>
+    <div class="state">
+      <span class="badge" id="health" data-health="no_data">…</span>
+      <span class="muted small" id="hero_age">–</span>
+    </div>
+    <div class="prefs">
+      <button type="button" class="icon" id="sound_toggle" aria-pressed="false" title="Chime on new alert">Sound off</button>
+      <button type="button" class="icon" id="theme_toggle" title="Colour theme">Auto</button>
+    </div>
+  </div>
+</header>
 
-  <section class="card">
-    <h2>Log <span class="muted small" id="log_source"></span></h2>
-    <pre id="logs">–</pre>
-  </section>
+<main>
+  <p class="banner" id="banner" role="alert" hidden></p>
 
-  <section class="card">
-    <details>
-      <summary>Config</summary>
-      <dl class="grid" id="config"></dl>
-    </details>
-  </section>
+  <div class="layout">
+    <section class="card area-alert" aria-labelledby="h_alert">
+      <h2 id="h_alert">Last alert</h2>
+      <div class="alert-head">
+        <p id="last_signal" class="big">–</p>
+        <span class="muted small" id="last_signal_age"></span>
+      </div>
+      <p id="last_signal_detail" class="muted small"></p>
+      <dl class="levels" id="levels" hidden>
+        <div><dt>Entry</dt><dd id="lvl_price">–</dd></div>
+        <div><dt>Stop</dt><dd id="lvl_sl" class="sell">–</dd></div>
+        <div><dt>Target</dt><dd id="lvl_tp" class="buy">–</dd></div>
+        <div><dt>R:R</dt><dd id="lvl_rr">–</dd></div>
+      </dl>
+      <div class="strength" id="strength" hidden>
+        <span class="muted small">Strength</span>
+        <span class="meter"><span class="meter-fill" id="strength_fill"></span></span>
+        <span class="small" id="strength_text">–</span>
+      </div>
+      <p class="muted small reason" id="lvl_reason"></p>
+    </section>
+
+    <section class="card area-setup" aria-labelledby="h_setup">
+      <h2 id="h_setup">Setup</h2>
+      <ol class="steps" id="setup_long" aria-label="Long setup">
+        <li class="side buy">Long</li>
+        <li data-step="stack">Bull stack</li>
+        <li data-step="pullback">Pullback</li>
+        <li data-step="trigger">Green fractal</li>
+      </ol>
+      <ol class="steps" id="setup_short" aria-label="Short setup">
+        <li class="side sell">Short</li>
+        <li data-step="stack">Bear stack</li>
+        <li data-step="pullback">Pullback</li>
+        <li data-step="trigger">Red fractal</li>
+      </ol>
+      <p class="muted small" id="setup_note"></p>
+    </section>
+
+    <section class="card area-chart" aria-labelledby="h_chart">
+      <div class="card-head">
+        <h2 id="h_chart">Chart</h2>
+        <div class="legend small" id="chart_legend" aria-live="off"></div>
+        <div class="tools">
+          <button type="button" class="mini" id="chart_fit">Fit</button>
+          <button type="button" class="mini" id="chart_latest">Latest</button>
+        </div>
+      </div>
+      <div class="chart" id="chart"></div>
+      <p class="muted small" id="chart_message" hidden></p>
+      <p class="muted tiny credit">
+        <span class="key key-fast"></span><span id="key_fast">EMA fast</span>
+        <span class="key key-mid"></span><span id="key_mid">EMA mid</span>
+        <span class="key key-slow"></span><span id="key_slow">EMA slow</span>
+        · dots are confirmed fractals, arrows are alerts ·
+        charting by <a href="https://www.tradingview.com/" rel="noopener noreferrer" target="_blank">TradingView</a>
+      </p>
+    </section>
+
+    <section class="card area-market" aria-labelledby="h_market">
+      <h2 id="h_market">Market</h2>
+      <dl class="grid">
+        <dt>Close</dt><dd id="close">–</dd>
+        <dt id="ema_fast_label">EMA fast</dt><dd id="ema_fast">–</dd>
+        <dt id="ema_mid_label">EMA mid</dt><dd id="ema_mid">–</dd>
+        <dt id="ema_slow_label">EMA slow</dt><dd id="ema_slow">–</dd>
+        <dt>ATR</dt><dd id="atr">–</dd>
+        <dt>Last bar</dt><dd id="last_bar_time">–</dd>
+      </dl>
+    </section>
+
+    <section class="card area-poll" aria-labelledby="h_poll">
+      <h2 id="h_poll">Last poll</h2>
+      <dl class="grid">
+        <dt>When</dt><dd id="poll_age">–</dd>
+        <dt>Result</dt><dd><span class="chip" id="result" data-result="">–</span></dd>
+        <dt>Bars loaded</dt><dd id="bars_loaded">–</dd>
+        <dt>Errors in a row</dt><dd id="consecutive_errors">–</dd>
+        <dt>Last error</dt><dd id="last_error" class="wrap">–</dd>
+      </dl>
+    </section>
+
+    <section class="card area-actions" aria-labelledby="h_actions">
+      <h2 id="h_actions">Quick commands</h2>
+      {% if actions_enabled %}
+      <form id="token_form" class="token">
+        <input id="token_input" type="password" autocomplete="off" placeholder="Action token" aria-label="Action token">
+        <button type="submit">Save</button>
+      </form>
+      <p class="muted small" id="token_state"></p>
+      {% else %}
+      <p class="muted small">Actions are disabled: set <code>DASHBOARD_TOKEN</code> and restart the dashboard.</p>
+      {% endif %}
+      <div class="buttons">
+        {% for a in actions %}
+        <button type="button" data-action="{{ a.name }}"{% if a.confirm %} data-confirm="1" class="danger"{% endif %}
+                {% if not actions_enabled %}disabled title="DASHBOARD_TOKEN is not set"
+                {% elif not a.supported %}disabled title="Needs systemd (Linux)"{% endif %}>{{ a.label }}</button>
+        {% endfor %}
+      </div>
+      <details id="action_details" hidden>
+        <summary class="small">Output</summary>
+        <pre id="action_output"></pre>
+      </details>
+    </section>
+
+    <section class="card area-history" aria-labelledby="h_history">
+      <div class="card-head">
+        <h2 id="h_history">Alert history</h2>
+        <span class="muted small" id="history_note"></span>
+      </div>
+      <div class="table-wrap">
+        <table class="history">
+          <thead>
+            <tr><th>Bar</th><th>Signal</th><th class="num">Entry</th><th class="num">Stop</th>
+                <th class="num">Target</th><th class="num">R:R</th><th class="num">Strength</th></tr>
+          </thead>
+          <tbody id="history_rows"></tbody>
+        </table>
+      </div>
+      <p class="muted small" id="history_empty" hidden></p>
+    </section>
+
+    <section class="card area-log" aria-labelledby="h_log">
+      <div class="card-head">
+        <h2 id="h_log">Log <span class="muted small" id="log_source"></span></h2>
+        <div class="tools">
+          <input type="search" id="log_filter" placeholder="Filter" aria-label="Filter log lines">
+          <label class="small check"><input type="checkbox" id="log_follow" checked> Follow</label>
+        </div>
+      </div>
+      <pre id="logs" tabindex="0">–</pre>
+    </section>
+
+    <section class="card area-config">
+      <details>
+        <summary>Config</summary>
+        <dl class="grid" id="config"></dl>
+      </details>
+    </section>
+  </div>
 </main>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 </body>
 </html>
