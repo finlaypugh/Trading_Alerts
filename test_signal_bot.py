@@ -18,6 +18,7 @@ import pandas as pd
 import pytest
 
 import signal_bot
+from dashboard import status as dashboard_status
 
 
 # ---------------------------------------------------------------------------
@@ -1297,10 +1298,24 @@ class TestWriteBars:
         assert last["close"] == 101.0
 
     def test_failure_does_not_raise_and_retries_next_poll(self, monkeypatch, tmp_path):
+        good = signal_bot.BARS_FILE
+        signal_bot.write_bars(ohlc_indicator_frame(10))
+        newer = ohlc_indicator_frame(11)
+
         monkeypatch.setattr(signal_bot, "BARS_FILE", tmp_path / "missing" / "bars.json")
-        df = ohlc_indicator_frame(10)
-        signal_bot.write_bars(df)
-        assert signal_bot._bars_written_for is None
+        signal_bot.write_bars(newer)
+        # The failed bar must not be remembered as written...
+        assert signal_bot._bars_written_for == str(newer.index[-2])
+
+        # ...so the next poll of the same bar writes it.
+        monkeypatch.setattr(signal_bot, "BARS_FILE", good)
+        signal_bot.write_bars(newer)
+        assert read_bars()["bars"][-1]["time"] == str(newer.index[-1])
+
+    def test_writes_exactly_the_fields_the_dashboard_reads(self):
+        signal_bot.write_bars(ohlc_indicator_frame(3))
+        for row in read_bars()["bars"]:
+            assert set(row) == set(dashboard_status.BAR_FIELDS)
 
     def test_run_once_writes_bars(self, run_once_env, monkeypatch):
         monkeypatch.setattr(signal_bot, "detect_signal", lambda df: (None, 0.0, None, 0, ""))
@@ -1352,6 +1367,29 @@ class TestAppendAlert:
         assert alert["sl"] < alert["price"] < alert["tp"]
         assert alert["rr"] == signal_bot.RR
         assert alert["reason"] == "test reason"
+
+    def test_run_once_logs_exactly_the_fields_the_dashboard_reads(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        (alert,) = read_alerts()
+        assert set(alert) == set(dashboard_status.ALERT_FIELDS)
+
+    def test_a_failed_alert_log_does_not_cause_a_resend(
+        self, run_once_env, monkeypatch, tmp_path
+    ):
+        # append_alert sits between the Discord send and save_last_signal. If
+        # it raised there, state would never be saved and every later poll
+        # would send the same alert again.
+        monkeypatch.setattr(signal_bot, "ALERTS_FILE", tmp_path / "missing" / "a.jsonl")
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
+        assert read_status()["result"] == "sent"
+        assert signal_bot.load_last_signal()["signal"] == "BUY"
+
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
+        assert read_status()["result"] == "suppressed"
 
     @pytest.mark.parametrize("setup", ["no_setup", "suppressed", "refused", "send_fails"])
     def test_run_once_logs_nothing_unless_sent(self, setup, run_once_env, monkeypatch):

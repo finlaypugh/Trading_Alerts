@@ -90,8 +90,8 @@ code { font-size: 0.9em; }
 .tiny { font-size: 0.72rem; }
 .big { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.01em; }
 .wrap { overflow-wrap: anywhere; }
-.buy, .bull { color: var(--ok); }
-.sell, .bear { color: var(--bad); }
+.buy { color: var(--ok); }
+.sell { color: var(--bad); }
 
 /* ---- top bar ---- */
 .topbar {
@@ -175,7 +175,7 @@ code { font-size: 0.9em; }
       "config  config  config";
   }
 }
-.area-alert { grid-area: alert; }
+.area-alert { grid-area: alert; container-type: inline-size; }
 .area-setup { grid-area: setup; }
 .area-chart { grid-area: chart; }
 .area-market { grid-area: market; }
@@ -205,7 +205,6 @@ code { font-size: 0.9em; }
 .grid dd { margin: 0; font-variant-numeric: tabular-nums; min-width: 0; }
 
 /* ---- last alert ---- */
-.area-alert { container-type: inline-size; }
 .alert-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .levels {
   display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px;

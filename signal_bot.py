@@ -405,7 +405,7 @@ def write_bars(df):
         _atomic_write(BARS_FILE, json.dumps(payload, default=str, allow_nan=False))
         _bars_written_for = last
     except Exception as exc:
-        print(f"[{TICKER}] failed to write bars file: {exc}")
+        print(f"[{TICKER}] failed to write bars file: {type(exc).__name__}: {exc}")
 
 
 def append_alert(**fields):
@@ -426,7 +426,10 @@ def append_alert(**fields):
         lines.append(json.dumps(record, default=str, allow_nan=False))
         _atomic_write(ALERTS_FILE, "\n".join(lines[-ALERTS_KEEP:]) + "\n")
     except Exception as exc:
-        print(f"[{TICKER}] failed to log alert: {exc}")
+        print(
+            f"[{TICKER}] failed to log {fields.get('signal')} alert for bar "
+            f"{fields.get('bar_time')} to the alert history: {type(exc).__name__}: {exc}"
+        )
 
 
 def _status_snapshot(df):

@@ -216,8 +216,9 @@ function baseTitle() {
   return parts.join(" ");
 }
 
-function updateTitle(flashOn = false) {
-  document.title = flashOn ? flashText : baseTitle();
+// Refreshes call this every few seconds; a running flash owns the title.
+function updateTitle() {
+  if (!flashTimer) document.title = baseTitle();
 }
 
 function stopFlash() {
@@ -233,7 +234,7 @@ function startFlash(text) {
   let ticks = 0;
   flashTimer = setInterval(() => {
     on = !on;
-    updateTitle(on);
+    document.title = on ? flashText : baseTitle();
     // A tab the user is already looking at only needs a brief flash.
     if (document.hasFocus() && ++ticks > 8) stopFlash();
   }, 1000);
@@ -365,16 +366,22 @@ function renderHistory(data) {
 
 async function syncAlerts(last) {
   const key = alertKey(last.last_signal);
-  if (key !== state.alertKey) {
+  if (key === state.alertKey) {
+    renderLastSignal(last);
+    return;
+  }
+  try {
     const data = await getJSON(`/api/alerts?n=${HISTORY_ROWS}`);
     state.alerts = data.alerts || [];
     renderHistory(data);
-    applyMarkers();
-    drawPriceLines();
     if (state.alertKey !== undefined && key) notifyNewAlert(last.last_signal);
     state.alertKey = key;
+  } finally {
+    // Even if the history failed, the state file's view of the last alert is current.
+    renderLastSignal(last);
   }
-  renderLastSignal(last);
+  // Last, so a chart error cannot cost the notification above.
+  redrawOverlays();
 }
 
 // ---- chart ----
@@ -443,8 +450,7 @@ function chartTheme() {
   chart.fast.applyOptions({ color: cssVar("--ema-fast") });
   chart.mid.applyOptions({ color: cssVar("--ema-mid") });
   chart.slow.applyOptions({ color: cssVar("--ema-slow") });
-  applyMarkers();
-  drawPriceLines();
+  redrawOverlays();
 }
 
 function renderLegend(bar) {
@@ -499,9 +505,13 @@ function setBars(data) {
     }
     chart.framed = true;
   }
+  redrawOverlays();
+  renderLegend(null);
+}
+
+function redrawOverlays() {
   applyMarkers();
   drawPriceLines();
-  renderLegend(null);
 }
 
 function applyMarkers() {
@@ -558,6 +568,17 @@ async function syncBars(status) {
   const key = (status.status && status.status.last_bar_time) || null;
   if (key === state.barsFor && state.bars.length) return;
   setBars(await getJSON("/api/bars"));
+  // The bot writes the bars file and the status file separately, and a failed
+  // bars write is retried on its next poll within the same bar. Until the
+  // chart holds the status file's last bar, keep refetching rather than
+  // marking it synced and freezing one bar behind.
+  const want = parseTime(key);
+  const have = state.bars[state.bars.length - 1];
+  if (want && have && have.ts < want.getTime() / 1000) {
+    chartMessage(`Chart is behind the bot: it ends at ${fmtDate(new Date(have.ts * 1000))}, ` +
+      `the bot is on ${fmtDate(want)}. Retrying.`);
+    return;
+  }
   state.barsFor = key;
 }
 
@@ -618,25 +639,51 @@ function renderConfig(data) {
 
 // ---- refresh loop ----
 
+// Each panel updates on its own, so one failing endpoint or a chart error
+// cannot freeze the rest of the page.
 async function refresh(force = false) {
   const hidden = document.hidden;
   if (state.refreshing) return;
   if (hidden && !force && Date.now() - state.lastRefresh < HIDDEN_REFRESH_MS) return;
   state.refreshing = true;
   state.lastRefresh = Date.now();
+  const failed = [];
+  const run = async (panel, fn) => {
+    try {
+      await fn();
+    } catch (err) {
+      console.error(`[dashboard] ${panel}:`, err);
+      failed.push({ panel, err });
+    }
+  };
   try {
     const requests = [getJSON("/api/status"), getJSON("/api/last-signal")];
     if (!hidden) requests.push(getJSON(`/api/logs?n=${LOG_LINES}`));
-    const [status, last, logs] = await Promise.all(requests);
-    renderStatus(status);
-    await syncAlerts(last);
+    const results = await Promise.allSettled(requests);
+    const take = (i) => {
+      if (results[i].status === "rejected") throw results[i].reason;
+      return results[i].value;
+    };
+
+    let status = null;
+    await run("status", () => { status = take(0); renderStatus(status); });
+    await run("alerts", () => syncAlerts(take(1)));
+    if (!state.config) await run("config", async () => renderConfig(await getJSON("/api/config")));
     if (!hidden) {
-      renderLogs(logs);
-      await syncBars(status);
+      await run("log", () => renderLogs(take(2)));
+      if (status) await run("chart", () => syncBars(status));
     }
-    showBanner(null);
-  } catch (err) {
-    showBanner(`Dashboard unreachable: ${err.message}`);
+
+    // fetch() rejects with a TypeError only when the server cannot be reached.
+    const unreachable = results.every((r) => r.status === "rejected" && r.reason instanceof TypeError);
+    if (unreachable) {
+      showBanner(`Dashboard unreachable: ${results[0].reason.message}`);
+    } else if (failed.length) {
+      showBanner(`Not updating: ${failed.map((f) => `${f.panel} (${f.err.message})`).join("; ")}. ` +
+        "Details in the browser console.");
+    } else {
+      showBanner(null);
+    }
   } finally {
     state.refreshing = false;
   }
@@ -770,7 +817,6 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!document.hidden) refresh(true);
   });
 
-  getJSON("/api/config").then(renderConfig).catch(() => {});
   refresh(true);
   setInterval(refresh, REFRESH_MS);
   setInterval(tickClock, 1000);
