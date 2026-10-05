@@ -95,6 +95,13 @@ button:hover:not(:disabled) { border-color: var(--accent); }
 button.danger { color: var(--bad); }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
 #action_output { margin-top: 10px; }
+.token { display: flex; gap: 8px; margin-bottom: 4px; }
+.token input {
+  flex: 1; min-width: 0; font: inherit; padding: 10px 12px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}
+#token_state { margin-bottom: 10px; }
+code { font-size: 0.9em; }
 #action_output.fail { outline: 1px solid var(--bad); }
 
 summary { cursor: pointer; font-weight: 600; }

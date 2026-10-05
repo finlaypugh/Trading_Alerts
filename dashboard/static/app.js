@@ -132,6 +132,25 @@ async function refresh() {
 
 // ---- quick commands ----
 
+// Kept for this tab only. Storage can be unavailable (private mode), so the
+// token then lives in memory until reload.
+const TOKEN_KEY = "dashboardToken";
+let memoryToken = "";
+
+function getToken() {
+  try { return sessionStorage.getItem(TOKEN_KEY) || ""; } catch { return memoryToken; }
+}
+
+function setToken(value) {
+  memoryToken = value;
+  try {
+    if (value) sessionStorage.setItem(TOKEN_KEY, value);
+    else sessionStorage.removeItem(TOKEN_KEY);
+  } catch { /* memory only */ }
+  const state = $("token_state");
+  if (state) state.textContent = value ? "Token saved for this tab." : "Enter the token to run commands.";
+}
+
 function showOutput(text, ok) {
   const out = $("action_output");
   out.hidden = false;
@@ -142,15 +161,23 @@ function showOutput(text, ok) {
 async function runAction(button) {
   const name = button.dataset.action;
   const label = button.textContent.trim();
+  if (!getToken()) {
+    showOutput(`${label}: enter the action token first.`, false);
+    $("token_input")?.focus();
+    return;
+  }
   if (button.dataset.confirm && !window.confirm(`${label}?`)) return;
 
   const buttons = document.querySelectorAll("button[data-action]");
   buttons.forEach((b) => { b.dataset.wasDisabled = b.disabled ? "1" : ""; b.disabled = true; });
   showOutput(`${label}: running…`, true);
   try {
-    const resp = await fetch(`/api/action/${encodeURIComponent(name)}`, { method: "POST" });
+    const resp = await fetch(`/api/action/${encodeURIComponent(name)}`, {
+      method: "POST", headers: { "X-Token": getToken() },
+    });
     let body;
     try { body = await resp.json(); } catch { body = { ok: false, output: `HTTP ${resp.status}` }; }
+    if (resp.status === 401) setToken("");
     const took = typeof body.duration_ms === "number" ? ` (${body.duration_ms} ms)` : "";
     showOutput(`${label}: ${body.ok ? "ok" : "failed"}${took}\n\n${body.output || ""}`, body.ok);
   } catch (err) {
@@ -162,6 +189,15 @@ async function runAction(button) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  const form = $("token_form");
+  if (form) {
+    setToken(getToken());
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      setToken($("token_input").value.trim());
+      $("token_input").value = "";
+    });
+  }
   document.querySelectorAll("button[data-action]").forEach((b) => {
     b.addEventListener("click", () => runAction(b));
   });

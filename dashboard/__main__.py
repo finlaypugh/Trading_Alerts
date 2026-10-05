@@ -4,12 +4,16 @@ import os
 
 from waitress import serve
 
-from .app import app
+from .app import app, token_configured
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 host = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
 port = int(os.environ.get("DASHBOARD_PORT", 8080))
 
+if not token_configured():
+    logging.getLogger("dashboard").warning(
+        "DASHBOARD_TOKEN is not set: status is visible but all actions are refused"
+    )
 print(f"Dashboard on http://{host}:{port}", flush=True)
 serve(app, host=host, port=port, threads=4)
