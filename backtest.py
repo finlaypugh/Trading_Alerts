@@ -76,6 +76,7 @@ os.environ["SIGNAL_TICKER"] = ARGS.instrument
 os.environ["SIGNAL_INTERVAL"] = GRANULARITY_TO_INTERVAL[ARGS.granularity]
 
 import signal_bot  # noqa: E402  (must follow the env setup above)
+from outcomes import resolve  # noqa: E402  (shared with the dashboard)
 
 
 def fetch_history(instrument, granularity, days, environment, token=None, end=None):
@@ -88,28 +89,6 @@ def fetch_history(instrument, granularity, days, environment, token=None, end=No
         instrument, granularity, end - pd.Timedelta(days=days), end,
         token=token, environment=environment,
     )
-
-
-def resolve(highs, lows, entry_i, signal, sl, tp):
-    """
-    Walk forward from the bar after entry until the stop or the target is
-    touched. Returns (outcome, exit_index) with outcome in
-    {"win", "loss", "open"}.
-    """
-    for j in range(entry_i + 1, len(highs)):
-        if signal == "BUY":
-            hit_sl = lows[j] <= sl
-            hit_tp = highs[j] >= tp
-        else:
-            hit_sl = highs[j] >= sl
-            hit_tp = lows[j] <= tp
-        if hit_sl:
-            # Checked first on purpose: when one bar covers both levels the
-            # order is unknowable, so the pessimistic reading wins.
-            return "loss", j
-        if hit_tp:
-            return "win", j
-    return "open", None
 
 
 def run(df):

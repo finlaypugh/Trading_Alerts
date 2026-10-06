@@ -10,8 +10,11 @@ import re
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+
+from outcomes import resolve
 
 ROOT = Path(__file__).resolve().parent.parent
 BOT_SERVICE = "signal-bot"
@@ -227,20 +230,94 @@ def load_bars():
     }
 
 
+def _number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # a JSON integer too large for a float
+        return False
+
+
+def add_outcomes(alerts, bars):
+    """
+    Mark each alert win / loss / open by walking the chart bars after the bar
+    it fired on, with the backtest's own rule: the stop wins when one bar spans
+    both levels. `r` is in multiples of the alert's risk; `exit_ts` is the bar
+    that hit the stop or target.
+
+    Otherwise the outcome is "unknown", with `unknown_reason`:
+    no_levels (signal, bar time, entry, stop or target missing), no_bars (no
+    bars to check against), before_bars / after_bars (its bar is older or
+    newer than the bars file holds), or missing_bar (a bar after the alert
+    has no prices before either level was reached: stepping over it could
+    miss the hit that decided the trade).
+    """
+    highs = [b.get("high") for b in bars]
+    lows = [b.get("low") for b in bars]
+    gaps = [i for i, (h, low) in enumerate(zip(highs, lows)) if not (_number(h) and _number(low))]
+    index = {b["ts"]: i for i, b in enumerate(bars)}
+    for a in alerts:
+        a.update(outcome="unknown", r=None, exit_ts=None, unknown_reason=None)
+        price, sl, tp, ts = a.get("price"), a.get("sl"), a.get("tp"), a.get("ts")
+        if (a.get("signal") not in ("BUY", "SELL") or ts is None
+                or not all(_number(v) for v in (price, sl, tp)) or price == sl):
+            a["unknown_reason"] = "no_levels"
+            continue
+        i = index.get(ts)
+        if i is None:
+            if not bars:
+                a["unknown_reason"] = "no_bars"
+            else:
+                a["unknown_reason"] = "after_bars" if ts > bars[-1]["ts"] else "before_bars"
+            continue
+        end = next((g for g in gaps if g > i), len(bars))
+        outcome, exit_i = resolve(highs[:end], lows[:end], i, a["signal"], sl, tp)
+        if outcome == "open" and end < len(bars):
+            a["unknown_reason"] = "missing_bar"
+            continue
+        a["outcome"] = outcome
+        if outcome == "win":
+            a["r"] = round(abs(tp - price) / abs(price - sl), 2)
+        elif outcome == "loss":
+            a["r"] = -1.0
+        if exit_i is not None:
+            a["exit_ts"] = bars[exit_i]["ts"]
+    return alerts
+
+
+def outcome_summary(alerts):
+    """Per side: outcome counts, and win rate and net R over closed trades only."""
+    summary = {}
+    for side in ("all", "BUY", "SELL"):
+        rows = [a for a in alerts if side == "all" or a.get("signal") == side]
+        count = Counter(a.get("outcome") for a in rows)
+        closed = count["win"] + count["loss"]
+        summary[side] = {
+            "wins": count["win"], "losses": count["loss"],
+            "open": count["open"], "unknown": count["unknown"],
+            "win_rate": round(count["win"] / closed, 3) if closed else None,
+            "net_r": round(sum(a["r"] for a in rows if a.get("r") is not None), 2),
+        }
+    return summary
+
+
 def load_alerts(n):
     """
     The newest n alerts from the bot's alert log, newest first, each with the
-    unix `ts` of the bar it fired on. Unparseable lines are skipped and
-    counted rather than failing the lot.
+    unix `ts` of the bar it fired on and its outcome against the chart bars.
+    `summary` covers exactly the alerts returned. `bars_message` says why the
+    bars could not be read, if they could not. Unparseable lines are skipped
+    and counted rather than failing the lot.
     """
     path = alerts_path()
+    empty = {"alerts": [], "skipped": 0, "summary": outcome_summary([]), "bars_message": None}
     try:
         lines = _tail_file(path, n)
     except FileNotFoundError:
-        return {"alerts": [], "skipped": 0, "message": "no alerts logged yet"}
+        return {**empty, "message": "no alerts logged yet"}
     except OSError as exc:
-        return {"alerts": [], "skipped": 0,
-                "message": f"{path.name} unreadable: {type(exc).__name__}"}
+        return {**empty, "message": f"{path.name} unreadable: {type(exc).__name__}"}
     alerts, skipped = [], 0
     for line in reversed(lines):
         if not line.strip():
@@ -254,9 +331,13 @@ def load_alerts(n):
             continue
         alerts.append({**{k: _clean(raw.get(k)) for k in ALERT_FIELDS},
                        "ts": _epoch(raw.get("bar_time"))})
+    bars = load_bars()
+    add_outcomes(alerts, bars["bars"])
     return {
         "alerts": alerts,
         "skipped": skipped,
+        "summary": outcome_summary(alerts),
+        "bars_message": bars["message"],
         "message": None if alerts else "no alerts logged yet",
     }
 

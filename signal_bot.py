@@ -153,7 +153,9 @@ STATUS_FILE = Path(__file__).parent / f".status_{TICKER.replace('/', '_')}.json"
 # append-only log of every alert sent. Both exist only for dashboard/.
 BARS_FILE = Path(__file__).parent / f".bars_{TICKER.replace('/', '_')}.json"
 ALERTS_FILE = Path(__file__).parent / f".alerts_{TICKER.replace('/', '_')}.jsonl"
-DASHBOARD_BARS = int(os.environ.get("DASHBOARD_BARS", 200))
+# About a day of 1m bars: the dashboard resolves alert outcomes against these,
+# so an alert older than the window shows as unknown.
+DASHBOARD_BARS = int(os.environ.get("DASHBOARD_BARS", 1500))
 ALERTS_KEEP = 500
 
 # Enough history for the slowest EMA to settle, plus a full fractal window

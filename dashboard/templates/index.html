@@ -23,6 +23,7 @@
     <div class="state">
       <span class="badge" id="health" data-health="no_data">…</span>
       <span class="muted small" id="hero_age">–</span>
+      <span class="muted small" id="bar_countdown" hidden></span>
     </div>
     <div class="prefs">
       <button type="button" class="icon" id="sound_toggle" aria-pressed="false" title="Chime on new alert">Sound off</button>
@@ -33,6 +34,7 @@
 
 <main>
   <p class="banner" id="banner" role="alert" hidden></p>
+  <p class="banner warn" id="health_banner" role="status" hidden></p>
 
   <div class="layout">
     <section class="card area-alert" aria-labelledby="h_alert">
@@ -52,6 +54,12 @@
         <span class="muted small">Strength</span>
         <span class="meter"><span class="meter-fill" id="strength_fill"></span></span>
         <span class="small" id="strength_text">–</span>
+      </div>
+      <div class="progress" id="progress" hidden>
+        <span class="muted small">Stop</span>
+        <span class="track" id="track" aria-hidden="true"><span class="track-mark" id="track_mark"></span></span>
+        <span class="muted small">Target</span>
+        <span class="small progress-text" id="progress_text">–</span>
       </div>
       <p class="muted small reason" id="lvl_reason"></p>
     </section>
@@ -88,7 +96,7 @@
         <span class="key key-fast"></span><span id="key_fast">EMA fast</span>
         <span class="key key-mid"></span><span id="key_mid">EMA mid</span>
         <span class="key key-slow"></span><span id="key_slow">EMA slow</span>
-        · dots are confirmed fractals, arrows are alerts ·
+        · dots are confirmed fractals, arrows are alerts, squares are exits ·
         charting by <a href="https://www.tradingview.com/" rel="noopener noreferrer" target="_blank">TradingView</a>
       </p>
     </section>
@@ -143,12 +151,23 @@
     <section class="card area-history" aria-labelledby="h_history">
       <div class="card-head">
         <h2 id="h_history">Alert history</h2>
-        <span class="muted small" id="history_note"></span>
+        <div class="tools">
+          <select id="history_filter" aria-label="Which alerts to show">
+            <option value="all">All</option>
+            <option value="BUY">Buys</option>
+            <option value="SELL">Sells</option>
+          </select>
+          <button type="button" class="mini" id="history_csv" title="Download the newest 500 alerts as CSV">CSV</button>
+        </div>
+        <p class="small history-summary" id="history_summary"></p>
+        <span class="muted small history-note" id="history_note"></span>
       </div>
       <div class="table-wrap">
         <table class="history">
           <thead>
-            <tr><th>Bar</th><th>Signal</th><th class="num">Entry</th><th class="num">Stop</th>
+            <tr><th>Bar</th><th>Signal</th>
+                <th title="Walked bar by bar from the alert; when one bar spans both stop and target it counts as a loss">Outcome</th>
+                <th class="num">Entry</th><th class="num">Stop</th>
                 <th class="num">Target</th><th class="num">R:R</th><th class="num">Strength</th></tr>
           </thead>
           <tbody id="history_rows"></tbody>

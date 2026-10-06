@@ -41,14 +41,18 @@ A small web page for any device on the home network. It is a separate
 process that only reads the bot's files, so stopping or crashing it never
 stops alerts. It shows:
 
-- price, EMA stack and health in a header that stays on screen;
-- a candlestick chart of the last 200 closed bars with the three EMAs,
-  confirmed fractals, past alerts, and the newest alert's entry, stop and
-  target;
+- price, EMA stack and health in a header that stays on screen, with a
+  countdown to the bar close, and a banner when the bot is late or down;
+- a candlestick chart of the recent closed bars with the three EMAs,
+  confirmed fractals, past alerts, and one alert's entry, stop, target and
+  exit (the newest, or whichever history row was clicked);
 - the setup strip: for each side, whether the stack is ordered, a pullback is
   live (or vetoed), and the bot is armed for a fractal;
-- the last alert with its levels and strength, and an alert history table
-  (click a row to find it on the chart);
+- the last alert with its levels, strength, and where price sits between its
+  stop and target, in R;
+- an alert history table with each alert's outcome (win, loss, open) and a
+  win rate and net R over the closed ones, filterable to buys or sells and
+  downloadable as CSV;
 - the last poll's outcome, a filterable log tail, the effective config, and
   a fixed set of buttons.
 
@@ -86,9 +90,19 @@ for the log panel.
 
 The bot writes three files for the dashboard next to its state file, all
 git-ignored: `.status_<ticker>.json` after every poll, `.bars_<ticker>.json`
-once per newly closed bar (`DASHBOARD_BARS`, default 200), and
+once per newly closed bar (`DASHBOARD_BARS`, default 1500), and
 `.alerts_<ticker>.jsonl`, one line per sent alert, newest 500 kept. History
 starts when this version is deployed; Clear last signal does not erase it.
+
+Outcomes are worked out by the dashboard from those bars with the backtest's
+own rule (`outcomes.py`): walking forward from the alert's bar, the first bar
+to touch the stop or target decides it, and a bar that touches both counts as
+a loss. An alert older than the bars file shows as unknown, so a larger
+`DASHBOARD_BARS` reaches further back. So does one whose trade was still
+running at a bar with no prices: skipping that bar could miss the hit that
+decided it, so the dashboard does not guess. A win is worth the alert's own
+reward-to-risk; a loss is -1R. These are fills at the exact levels, before
+spread and slippage.
 
 Health comes from `.status_<ticker>.json`: **ok**, **error** (last poll raised), **stale** (no poll for 2×
 `SIGNAL_POLL_SECONDS`), **down** (10×), **no data** (no file yet).

@@ -282,6 +282,153 @@ class TestAlerts:
         assert alert["sent_utc"]
 
 
+def minute(m):
+    return f"2026-10-05 11:{m:02d}:00+00:00"
+
+
+def quiet(m, **fields):
+    """A bar that touches neither the stop nor the target of TestOutcomes.BUY."""
+    return bar(minute(m), **{"open": 10.0, "high": 10.2, "low": 9.8, "close": 10.0, **fields})
+
+
+class TestOutcomes:
+    BUY = {"bar_time": minute(50), "signal": "BUY", "price": 10.0, "sl": 9.0, "tp": 11.5}
+    SELL = {"bar_time": minute(50), "signal": "SELL", "price": 10.0, "sl": 11.0, "tp": 8.5}
+
+    def only_alert(self, client):
+        (alert,) = client.get("/api/alerts").json["alerts"]
+        return alert
+
+    def test_target_hit_is_a_win_worth_the_reward_in_r(self, client):
+        write_bars([quiet(50), quiet(51), quiet(52, high=11.6)])
+        write_alerts(self.BUY)
+        alert = self.only_alert(client)
+        assert alert["outcome"] == "win"
+        assert alert["r"] == 1.5
+        assert alert["exit_ts"] == status._epoch(minute(52))
+
+    def test_stop_hit_is_a_loss_of_one_r(self, client):
+        write_bars([quiet(50), quiet(51, low=8.9)])
+        write_alerts(self.BUY)
+        alert = self.only_alert(client)
+        assert (alert["outcome"], alert["r"]) == ("loss", -1.0)
+        assert alert["exit_ts"] == status._epoch(minute(51))
+
+    def test_one_bar_spanning_both_levels_counts_as_a_loss(self, client):
+        write_bars([quiet(50), quiet(51, high=12.0, low=8.0)])
+        write_alerts(self.BUY)
+        assert self.only_alert(client)["outcome"] == "loss"
+
+    def test_the_entry_bar_itself_does_not_count(self, client):
+        write_bars([quiet(50, high=12.0), quiet(51)])
+        write_alerts(self.BUY)
+        alert = self.only_alert(client)
+        assert (alert["outcome"], alert["r"], alert["exit_ts"]) == ("open", None, None)
+
+    def test_sell_levels_are_mirrored(self, client):
+        write_bars([quiet(50), quiet(51, low=8.4)])
+        write_alerts(self.SELL)
+        alert = self.only_alert(client)
+        assert (alert["outcome"], alert["r"]) == ("win", 1.5)
+
+    def test_alert_older_than_the_bars_is_unknown(self, client):
+        write_bars([quiet(55), quiet(56, high=12.0)])
+        write_alerts(self.BUY)
+        alert = self.only_alert(client)
+        assert (alert["outcome"], alert["r"]) == ("unknown", None)
+        assert alert["unknown_reason"] == "before_bars"
+
+    def test_alert_newer_than_the_bars_is_unknown(self, client):
+        write_bars([quiet(48), quiet(49)])
+        write_alerts(self.BUY)
+        assert self.only_alert(client)["unknown_reason"] == "after_bars"
+
+    @pytest.mark.parametrize("missing", ["price", "sl", "tp", "signal", "bar_time"])
+    def test_missing_levels_are_unknown(self, client, missing):
+        write_bars([quiet(50), quiet(51, high=12.0)])
+        write_alerts({k: v for k, v in self.BUY.items() if k != missing})
+        alert = self.only_alert(client)
+        assert (alert["outcome"], alert["unknown_reason"]) == ("unknown", "no_levels")
+
+    def test_zero_risk_alert_is_unknown_not_a_500(self, client):
+        # price == sl would divide by zero when the win is priced in R.
+        write_bars([quiet(50), quiet(51, high=12.0)])
+        write_alerts(dict(self.BUY, sl=10.0))
+        resp = client.get("/api/alerts")
+        assert resp.status_code == 200
+        assert resp.json["alerts"][0]["unknown_reason"] == "no_levels"
+
+    def test_integer_too_big_for_a_float_is_unknown_not_a_500(self, client):
+        write_bars([quiet(50), quiet(51, high=12.0)])
+        write_alerts('{"bar_time": "%s", "signal": "BUY", "price": 1%s, "sl": 9.0, "tp": 11.5}'
+                     % (minute(50), "0" * 400))
+        resp = client.get("/api/alerts")
+        assert resp.status_code == 200
+        assert resp.json["alerts"][0]["outcome"] == "unknown"
+
+    def test_no_bars_file_makes_everything_unknown_and_says_why(self, client):
+        write_alerts(self.BUY)
+        data = client.get("/api/alerts").json
+        assert data["alerts"][0]["unknown_reason"] == "no_bars"
+        assert "no bars yet" in data["bars_message"]
+
+    def test_bars_message_is_none_when_bars_are_fine(self, client):
+        write_bars([quiet(50)])
+        write_alerts(self.BUY)
+        assert client.get("/api/alerts").json["bars_message"] is None
+
+    def test_a_bar_without_prices_stops_the_walk(self, client):
+        # The missing bar might have hit the stop; a later target hit must
+        # not be reported as a win.
+        write_bars([quiet(50), quiet(51, high=None, low=None), quiet(52, high=11.6)])
+        write_alerts(self.BUY)
+        alert = self.only_alert(client)
+        assert (alert["outcome"], alert["r"], alert["exit_ts"]) == ("unknown", None, None)
+        assert alert["unknown_reason"] == "missing_bar"
+
+    def test_an_exit_before_a_bar_without_prices_still_counts(self, client):
+        write_bars([quiet(50), quiet(51, low=8.9), quiet(52, high=None)])
+        write_alerts(self.BUY)
+        alert = self.only_alert(client)
+        assert (alert["outcome"], alert["exit_ts"]) == ("loss", status._epoch(minute(51)))
+
+    def test_a_bar_without_prices_before_the_alert_does_not_matter(self, client):
+        write_bars([quiet(49, low=None), quiet(50), quiet(51, high=11.6)])
+        write_alerts(self.BUY)
+        assert self.only_alert(client)["outcome"] == "win"
+
+    def test_summary_covers_only_the_alerts_returned(self, client):
+        write_bars([quiet(50), quiet(51, low=8.9)])
+        write_alerts(*[dict(self.BUY, price=10.0 + i / 100) for i in range(3)],
+                     dict(self.BUY, bar_time=minute(30)), dict(self.BUY, bar_time=minute(31)))
+        data = client.get("/api/alerts?n=2").json
+        assert len(data["alerts"]) == 2
+        assert data["summary"]["all"]["unknown"] == 2
+        assert data["summary"]["all"]["losses"] == 0
+
+    def test_summary_per_side_counts_closed_trades_only(self, client):
+        write_bars([quiet(m) for m in range(40, 50)]
+                   + [quiet(50), quiet(51, high=11.6), quiet(52, low=8.4)])
+        write_alerts(
+            dict(self.BUY, bar_time=minute(30)),               # unknown
+            dict(self.BUY, bar_time=minute(40), sl=9.9),        # loss at 11:41
+            dict(self.SELL, bar_time=minute(51), sl=11.6),      # win at 11:52, 1.5/1.6 R
+            self.BUY,                                           # win at 11:51
+            dict(self.BUY, bar_time=minute(52), sl=8.0),        # open
+        )
+        summary = client.get("/api/alerts").json["summary"]
+        assert summary["all"] == {"wins": 2, "losses": 1, "open": 1, "unknown": 1,
+                                  "win_rate": 0.667, "net_r": 1.44}
+        assert summary["SELL"] == {"wins": 1, "losses": 0, "open": 0, "unknown": 0,
+                                   "win_rate": 1.0, "net_r": 0.94}
+        assert summary["BUY"]["win_rate"] == 0.5
+
+    def test_summary_without_alerts(self, client):
+        summary = client.get("/api/alerts").json["summary"]
+        assert summary["all"] == {"wins": 0, "losses": 0, "open": 0, "unknown": 0,
+                                  "win_rate": None, "net_r": 0}
+
+
 # ---------------------------------------------------------------------------
 # Secrets
 # ---------------------------------------------------------------------------
