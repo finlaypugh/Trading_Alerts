@@ -82,7 +82,7 @@ SIGNAL_COLS = [
     "long_depth", "short_depth", "long_vetoed", "short_vetoed",
     "long_pivot_depth", "short_pivot_depth",
     "bull_stack_bars", "bear_stack_bars",
-    "session_gap",
+    "session_gap", "Spread",
 ]
 
 # Neutral baseline: no arrows, flat EMAs, non-zero ATR.
@@ -96,6 +96,9 @@ SIGNAL_BASE = {
     "long_pivot_depth": 0, "short_pivot_depth": 0,
     "bull_stack_bars": 0, "bear_stack_bars": 0,
     "session_gap": False,
+    # Unknown, so the min-risk-in-spreads floor stays out of the way of tests
+    # that are about something else.
+    "Spread": float("nan"),
 }
 
 # Comfortably past any MIN_STACK_BARS a test sets, so the stack-stability gate
@@ -689,7 +692,27 @@ class TestShortDepthCap:
 # ---------------------------------------------------------------------------
 
 class TestBuildSlTp:
-    def test_depth_one_long_stops_below_the_mid_ema(self):
+    def test_default_stop_reference_is_the_slow_ema(self):
+        assert signal_bot.STOP_REF == "slow"
+
+    def test_depth_one_long_stops_below_the_slow_ema(self):
+        # The setup is only invalidated by a close beyond the slow EMA; a
+        # depth-1 pullback that reaches the mid has become depth 2, not failed.
+        sl, tp, rr, risk = signal_bot.build_sl_tp(
+            "BUY", price=112.0, depth=1, ema_mid=105.0, ema_slow=100.0, atr=4.0
+        )
+        assert sl == pytest.approx(100.0 - signal_bot.SL_BUFFER_ATR * 4.0)
+        assert sl < 112.0 < tp
+
+    def test_depth_one_short_stops_above_the_slow_ema(self):
+        sl, tp, _, _ = signal_bot.build_sl_tp(
+            "SELL", price=88.0, depth=1, ema_mid=95.0, ema_slow=100.0, atr=4.0
+        )
+        assert sl == pytest.approx(100.0 + signal_bot.SL_BUFFER_ATR * 4.0)
+        assert tp < 88.0 < sl
+
+    def test_tiered_depth_one_long_stops_below_the_mid_ema(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "STOP_REF", "tiered")
         sl, tp, rr, risk = signal_bot.build_sl_tp(
             "BUY", price=112.0, depth=1, ema_mid=105.0, ema_slow=100.0, atr=4.0
         )
@@ -702,12 +725,20 @@ class TestBuildSlTp:
         )
         assert sl == pytest.approx(100.0 - signal_bot.SL_BUFFER_ATR * 4.0)
 
-    def test_depth_one_short_stops_above_the_mid_ema(self):
+    def test_tiered_depth_one_short_stops_above_the_mid_ema(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "STOP_REF", "tiered")
         sl, tp, _, _ = signal_bot.build_sl_tp(
             "SELL", price=88.0, depth=1, ema_mid=95.0, ema_slow=100.0, atr=4.0
         )
         assert sl == pytest.approx(95.0 + signal_bot.SL_BUFFER_ATR * 4.0)
         assert tp < 88.0 < sl
+
+    def test_tiered_leaves_depth_two_on_the_slow_ema(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "STOP_REF", "tiered")
+        sl, _, _, _ = signal_bot.build_sl_tp(
+            "BUY", price=112.0, depth=2, ema_mid=105.0, ema_slow=100.0, atr=4.0
+        )
+        assert sl == pytest.approx(100.0 - signal_bot.SL_BUFFER_ATR * 4.0)
 
     def test_depth_two_short_stops_above_the_slow_ema(self):
         sl, _, _, _ = signal_bot.build_sl_tp(
@@ -733,15 +764,45 @@ class TestBuildSlTp:
         assert tp == pytest.approx(price - signal_bot.RR * risk)
 
     def test_returns_none_when_stop_lands_on_the_wrong_side_of_entry(self):
-        # Long, but price is already below the mid EMA the stop references.
+        # Long, but price is already below the slow EMA the stop references.
         assert signal_bot.build_sl_tp(
-            "BUY", price=100.0, depth=1, ema_mid=105.0, ema_slow=95.0, atr=4.0
+            "BUY", price=100.0, depth=1, ema_mid=110.0, ema_slow=105.0, atr=4.0
         ) is None
 
     def test_returns_none_for_a_short_below_its_stop_reference(self):
         assert signal_bot.build_sl_tp(
-            "SELL", price=100.0, depth=1, ema_mid=95.0, ema_slow=105.0, atr=4.0
+            "SELL", price=100.0, depth=1, ema_mid=90.0, ema_slow=95.0, atr=4.0
         ) is None
+
+    # Risk on these inputs: 112 - (100 - 0.25 * 4) = 13.
+    def test_min_risk_floor_refuses_a_stop_too_tight_for_the_spread(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "MIN_RISK_SPREADS", 6.0)
+        assert signal_bot.build_sl_tp(
+            "BUY", price=112.0, depth=2, ema_mid=105.0, ema_slow=100.0, atr=4.0,
+            spread=2.5,
+        ) is None
+
+    def test_min_risk_floor_accepts_a_stop_wide_enough(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "MIN_RISK_SPREADS", 6.0)
+        assert signal_bot.build_sl_tp(
+            "BUY", price=112.0, depth=2, ema_mid=105.0, ema_slow=100.0, atr=4.0,
+            spread=2.0,
+        ) is not None
+
+    @pytest.mark.parametrize("spread", [None, float("nan"), 0.0])
+    def test_unknown_spread_skips_the_floor(self, monkeypatch, spread):
+        monkeypatch.setattr(signal_bot, "MIN_RISK_SPREADS", 1000.0)
+        assert signal_bot.build_sl_tp(
+            "BUY", price=112.0, depth=2, ema_mid=105.0, ema_slow=100.0, atr=4.0,
+            spread=spread,
+        ) is not None
+
+    def test_min_risk_floor_zero_is_off(self, monkeypatch):
+        monkeypatch.setattr(signal_bot, "MIN_RISK_SPREADS", 0.0)
+        assert signal_bot.build_sl_tp(
+            "BUY", price=112.0, depth=2, ema_mid=105.0, ema_slow=100.0, atr=4.0,
+            spread=100.0,
+        ) is not None
 
     def test_max_risk_ceiling_rejects_an_absurdly_wide_stop(self, monkeypatch):
         monkeypatch.setattr(signal_bot, "MAX_RISK_ATR", 2.0)
@@ -935,13 +996,13 @@ class TestRunOnceRefusedTrades:
     branch if those numbers drift.
     """
 
-    # Depth-1 long: the stop references the mid EMA at 105 with a 0.25 x ATR(10)
-    # buffer, putting it at 102.5. A close of 100 sits below its own stop.
-    WRONG_SIDE = dict(BUY_CURR, Close=100.0)
+    # Depth-1 long: the stop references the slow EMA at 100 with a 0.25 x
+    # ATR(10) buffer, putting it at 97.5. A close of 96 sits below its own stop.
+    WRONG_SIDE = dict(BUY_CURR, Close=96.0)
 
     def test_premise_wrong_side_inputs_really_are_refused(self):
         assert signal_bot.build_sl_tp(
-            "BUY", price=100.0, depth=1, ema_mid=105.0, ema_slow=100.0, atr=10.0
+            "BUY", price=96.0, depth=1, ema_mid=105.0, ema_slow=100.0, atr=10.0
         ) is None
 
     def test_premise_valid_inputs_really_are_accepted(self):
@@ -977,12 +1038,30 @@ class TestRunOnceRefusedTrades:
         assert len(run_once_env.sent) == 1
 
     def test_max_risk_ceiling_also_suppresses_the_alert(self, run_once_env, monkeypatch):
-        # Risk is 9.5 against ATR 10, so a 0.5 ATR ceiling rejects it.
+        # Risk is 14.5 against ATR 10, so a 0.5 ATR ceiling rejects it.
         monkeypatch.setattr(signal_bot, "MAX_RISK_ATR", 0.5)
         monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
         signal_bot.run_once()
         assert run_once_env.sent == []
         assert signal_bot.load_last_signal() is None
+
+    def test_a_stop_too_tight_for_the_live_spread_suppresses_the_alert(
+        self, run_once_env, monkeypatch
+    ):
+        # Risk 14.5 is under 6 spreads of 5.0, so the bar's own spread refuses it.
+        monkeypatch.setattr(signal_bot, "MIN_RISK_SPREADS", 6.0)
+        run_once_env.curr = dict(BUY_CURR, Spread=5.0)
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        assert run_once_env.sent == []
+        assert signal_bot.load_last_signal() is None
+
+    def test_a_normal_spread_still_alerts(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "MIN_RISK_SPREADS", 6.0)
+        run_once_env.curr = dict(BUY_CURR, Spread=0.5)
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
 
     def test_a_valid_setup_still_alerts_and_records_state(self, run_once_env, monkeypatch):
         monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
@@ -1478,8 +1557,18 @@ class TestSendDiscordAlert:
         assert "1:1.50" in content
         assert captured["timeout"] == 10
 
-    def test_depth_one_names_the_mid_ema_as_the_stop_reference(self, monkeypatch):
+    def test_depth_one_names_the_slow_ema_as_the_stop_reference(self, monkeypatch):
         captured = {}
+        monkeypatch.setattr(
+            signal_bot.requests, "post",
+            lambda url, json, timeout: captured.update(json=json) or _FakeResponse(),
+        )
+        signal_bot.send_discord_alert(**dict(ALERT_KWARGS, depth=1))
+        assert f"stop referenced to EMA{signal_bot.EMA_SLOW}" in captured["json"]["content"]
+
+    def test_tiered_depth_one_names_the_mid_ema_as_the_stop_reference(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(signal_bot, "STOP_REF", "tiered")
         monkeypatch.setattr(
             signal_bot.requests, "post",
             lambda url, json, timeout: captured.update(json=json) or _FakeResponse(),
