@@ -336,21 +336,75 @@ class TestOutcomes:
         write_alerts(self.BUY)
         alert = self.only_alert(client)
         assert (alert["outcome"], alert["r"]) == ("unknown", None)
+        assert alert["unknown_reason"] == "before_bars"
 
-    @pytest.mark.parametrize("missing", ["price", "sl", "tp", "signal"])
+    def test_alert_newer_than_the_bars_is_unknown(self, client):
+        write_bars([quiet(48), quiet(49)])
+        write_alerts(self.BUY)
+        assert self.only_alert(client)["unknown_reason"] == "after_bars"
+
+    @pytest.mark.parametrize("missing", ["price", "sl", "tp", "signal", "bar_time"])
     def test_missing_levels_are_unknown(self, client, missing):
         write_bars([quiet(50), quiet(51, high=12.0)])
         write_alerts({k: v for k, v in self.BUY.items() if k != missing})
-        assert self.only_alert(client)["outcome"] == "unknown"
+        alert = self.only_alert(client)
+        assert (alert["outcome"], alert["unknown_reason"]) == ("unknown", "no_levels")
 
-    def test_no_bars_file_makes_everything_unknown(self, client):
-        write_alerts(self.BUY)
-        assert self.only_alert(client)["outcome"] == "unknown"
+    def test_zero_risk_alert_is_unknown_not_a_500(self, client):
+        # price == sl would divide by zero when the win is priced in R.
+        write_bars([quiet(50), quiet(51, high=12.0)])
+        write_alerts(dict(self.BUY, sl=10.0))
+        resp = client.get("/api/alerts")
+        assert resp.status_code == 200
+        assert resp.json["alerts"][0]["unknown_reason"] == "no_levels"
 
-    def test_bars_with_missing_prices_are_stepped_over(self, client):
-        write_bars([quiet(50), quiet(51, high=None), quiet(52, high=11.6)])
+    def test_integer_too_big_for_a_float_is_unknown_not_a_500(self, client):
+        write_bars([quiet(50), quiet(51, high=12.0)])
+        write_alerts('{"bar_time": "%s", "signal": "BUY", "price": 1%s, "sl": 9.0, "tp": 11.5}'
+                     % (minute(50), "0" * 400))
+        resp = client.get("/api/alerts")
+        assert resp.status_code == 200
+        assert resp.json["alerts"][0]["outcome"] == "unknown"
+
+    def test_no_bars_file_makes_everything_unknown_and_says_why(self, client):
         write_alerts(self.BUY)
-        assert self.only_alert(client)["exit_ts"] == status._epoch(minute(52))
+        data = client.get("/api/alerts").json
+        assert data["alerts"][0]["unknown_reason"] == "no_bars"
+        assert "no bars yet" in data["bars_message"]
+
+    def test_bars_message_is_none_when_bars_are_fine(self, client):
+        write_bars([quiet(50)])
+        write_alerts(self.BUY)
+        assert client.get("/api/alerts").json["bars_message"] is None
+
+    def test_a_bar_without_prices_stops_the_walk(self, client):
+        # The missing bar might have hit the stop; a later target hit must
+        # not be reported as a win.
+        write_bars([quiet(50), quiet(51, high=None, low=None), quiet(52, high=11.6)])
+        write_alerts(self.BUY)
+        alert = self.only_alert(client)
+        assert (alert["outcome"], alert["r"], alert["exit_ts"]) == ("unknown", None, None)
+        assert alert["unknown_reason"] == "missing_bar"
+
+    def test_an_exit_before_a_bar_without_prices_still_counts(self, client):
+        write_bars([quiet(50), quiet(51, low=8.9), quiet(52, high=None)])
+        write_alerts(self.BUY)
+        alert = self.only_alert(client)
+        assert (alert["outcome"], alert["exit_ts"]) == ("loss", status._epoch(minute(51)))
+
+    def test_a_bar_without_prices_before_the_alert_does_not_matter(self, client):
+        write_bars([quiet(49, low=None), quiet(50), quiet(51, high=11.6)])
+        write_alerts(self.BUY)
+        assert self.only_alert(client)["outcome"] == "win"
+
+    def test_summary_covers_only_the_alerts_returned(self, client):
+        write_bars([quiet(50), quiet(51, low=8.9)])
+        write_alerts(*[dict(self.BUY, price=10.0 + i / 100) for i in range(3)],
+                     dict(self.BUY, bar_time=minute(30)), dict(self.BUY, bar_time=minute(31)))
+        data = client.get("/api/alerts?n=2").json
+        assert len(data["alerts"]) == 2
+        assert data["summary"]["all"]["unknown"] == 2
+        assert data["summary"]["all"]["losses"] == 0
 
     def test_summary_per_side_counts_closed_trades_only(self, client):
         write_bars([quiet(m) for m in range(40, 50)]

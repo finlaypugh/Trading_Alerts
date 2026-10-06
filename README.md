@@ -98,7 +98,9 @@ Outcomes are worked out by the dashboard from those bars with the backtest's
 own rule (`outcomes.py`): walking forward from the alert's bar, the first bar
 to touch the stop or target decides it, and a bar that touches both counts as
 a loss. An alert older than the bars file shows as unknown, so a larger
-`DASHBOARD_BARS` reaches further back. A win is worth the alert's own
+`DASHBOARD_BARS` reaches further back. So does one whose trade was still
+running at a bar with no prices: skipping that bar could miss the hit that
+decided it, so the dashboard does not guess. A win is worth the alert's own
 reward-to-risk; a loss is -1R. These are fills at the exact levels, before
 spread and slippage.
 
