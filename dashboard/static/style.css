@@ -69,6 +69,8 @@
 }
 
 * { box-sizing: border-box; }
+/* The hidden attribute must win over the display of .levels, .strength, .progress and the rest. */
+[hidden] { display: none !important; }
 html { -webkit-text-size-adjust: 100%; }
 body {
   margin: 0;

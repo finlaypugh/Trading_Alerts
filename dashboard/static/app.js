@@ -10,8 +10,9 @@ const LOG_LINES = 200;
 const HISTORY_ROWS = 50;
 const CSV_ROWS = 500;
 const CHART_BARS_SHOWN = 120;
-// Bars of these sizes close on UTC clock boundaries, so a countdown is exact.
-const COUNTDOWN_INTERVAL = /^\d+\s*[mh]$/i;
+// Bar sizes that divide an hour close on UTC clock boundaries, so a countdown
+// is exact. 2h and 4h are left out: OANDA aligns those to 17:00 New York.
+const COUNTDOWN_INTERVAL = /^(?:(?:1|2|3|4|5|6|10|12|15|20|30)\s*m|1\s*h)$/i;
 // Failed polls in a row before the error state earns a banner, not just the badge.
 const ERROR_STREAK_BANNER = 3;
 
@@ -37,6 +38,7 @@ const state = {
   summary: null,
   historyMessage: "",
   skipped: 0,
+  barsMessage: "",
   historyFilter: "all",
   selectedKey: null,  // the alert drawn on the chart; null means the newest
   liveCells: [],      // [td, alert] for open trades, updated with every price
@@ -369,6 +371,8 @@ function renderLastSignal(data) {
   $("strength").hidden = !(full && typeof full.strength === "number");
   state.alertSentAt = null;
   $("last_signal_age").textContent = "";
+  // Before the early return, so Clear last signal also clears the track.
+  renderProgress(full);
 
   if (!sig) {
     head.className = "big muted";
@@ -402,9 +406,29 @@ function renderLastSignal(data) {
     const bar = parseTime(sig.bar_time);
     state.alertSentAt = bar ? bar.getTime() : null;
   }
-  renderProgress(full);
   tickClock();
 }
+
+const OUTCOME_CLASS = { win: "buy", loss: "sell", open: "open" };
+
+// Why the server could not resolve an alert (status.add_outcomes).
+const UNKNOWN_WHY = {
+  no_levels: "the alert has no entry, stop or target",
+  no_bars: "there are no chart bars to check it against",
+  before_bars: "it is older than the chart's bars",
+  after_bars: "it is newer than the chart's bars",
+  missing_bar: "a bar after it has no prices, so the hit that decided it may be missing",
+};
+
+function unknownWhy(a) {
+  return UNKNOWN_WHY[a.unknown_reason] || "it could not be checked against the chart's bars";
+}
+
+function joinText(...parts) {
+  return parts.filter(Boolean).join(" ");
+}
+
+const openText = (a) => joinText("Open", fmtR(liveR(a)));
 
 // Where the last alert's trade stands: a marker between its stop and target.
 function renderProgress(a) {
@@ -418,32 +442,33 @@ function renderProgress(a) {
   let text;
   let where = null;
   if (a.outcome === "win") {
-    text = `Hit target ${fmtR(a.r) || ""}`;
+    text = joinText("Hit target", fmtR(a.r));
     where = 1;
   } else if (a.outcome === "loss") {
-    text = `Stopped out ${fmtR(a.r) || ""}`;
+    text = joinText("Stopped out", fmtR(a.r));
     where = 0;
   } else {
-    const r = liveR(a);
     text = a.outcome === "open"
-      ? `Open ${fmtR(r) || ""}`
-      : `Now ${fmtR(r) || "–"} · outcome unknown: older than the chart's bars`;
+      ? openText(a)
+      : `Now ${fmtR(liveR(a)) || "–"} · outcome unknown: ${unknownWhy(a)}`;
     if (typeof state.close === "number") where = at(state.close);
   }
   const mark = $("track_mark");
   mark.hidden = where === null;
   if (where !== null) mark.style.left = `${(where * 100).toFixed(1)}%`;
   const progressText = $("progress_text");
-  progressText.textContent = text.trim();
-  progressText.className = `small progress-text ${a.outcome === "win" ? "buy" : a.outcome === "loss" ? "sell" : ""}`;
+  progressText.textContent = text;
+  progressText.className = `small progress-text ${OUTCOME_CLASS[a.outcome] || ""}`;
 }
 
+// [class, text, tooltip] for an alert's outcome cell.
 function outcomeCell(a) {
+  const cls = OUTCOME_CLASS[a.outcome] || "muted";
   switch (a.outcome) {
-    case "win": return ["buy", `Win ${fmtR(a.r) || ""}`, exitTitle("Hit target", a)];
-    case "loss": return ["sell", `Loss ${fmtR(a.r) || ""}`, exitTitle("Stopped out", a)];
-    case "open": return ["open", "", "Still open: neither the stop nor the target has been touched"];
-    default: return ["muted", "–", "Unknown: the alert is older than the chart's bars, or has no levels"];
+    case "win": return [cls, joinText("Win", fmtR(a.r)), exitTitle("Hit target", a)];
+    case "loss": return [cls, joinText("Loss", fmtR(a.r)), exitTitle("Stopped out", a)];
+    case "open": return [cls, openText(a), "Still open: neither the stop nor the target has been touched"];
+    default: return [cls, "–", `Unknown: ${unknownWhy(a)}`];
   }
 }
 
@@ -454,9 +479,7 @@ function exitTitle(what, a) {
 
 // Open trades move with the price, every refresh, without rebuilding the table.
 function updateLiveCells() {
-  for (const [td, a] of state.liveCells) {
-    td.textContent = `Open ${fmtR(liveR(a)) || ""}`.trim();
-  }
+  for (const [td, a] of state.liveCells) td.textContent = openText(a);
 }
 
 function visibleAlerts(alerts = state.alerts) {
@@ -483,7 +506,7 @@ function renderSummary() {
   }
   const rest = [];
   if (s.open) rest.push(`${s.open} open`);
-  if (s.unknown) rest.push(`${s.unknown} older than the chart`);
+  if (s.unknown) rest.push(`${s.unknown} unknown`);
   if (rest.length) out.append(el("span", "muted", ` · ${rest.join(" · ")}`));
 }
 
@@ -492,13 +515,11 @@ function renderHistory() {
   body.replaceChildren();
   state.liveCells = [];
   const alerts = visibleAlerts();
-  const selected = chartAlert();
   for (const a of alerts) {
     const tr = el("tr");
     tr.tabIndex = 0;
     tr.title = a.reason || "";
     tr.dataset.key = alertKey(a);
-    tr.classList.toggle("selected", a === selected);
     const side = a.signal === "BUY" ? "buy" : a.signal === "SELL" ? "sell" : "";
     const [cls, text, title] = outcomeCell(a);
     // Next to the signal, so a phone shows it without scrolling the table.
@@ -519,7 +540,7 @@ function renderHistory() {
     tr.addEventListener("keydown", (e) => { if (e.key === "Enter") focusAlert(a); });
     body.append(tr);
   }
-  updateLiveCells();
+  markSelectedRow();
   renderSummary();
 
   const empty = $("history_empty");
@@ -532,11 +553,14 @@ function renderHistory() {
       " · click a row to show it on the chart");
   }
   if (state.skipped) note.push(`${state.skipped} unreadable line${state.skipped === 1 ? "" : "s"} skipped`);
+  if (state.barsMessage) note.push(`outcomes unavailable: ${state.barsMessage}`);
   $("history_note").textContent = note.join(" · ");
 }
 
 async function syncAlerts(last) {
   const key = alertKey(last.last_signal);
+  // Read before the await: the status can move on to a newer bar while the
+  // history is in flight, and that bar must still trigger its own refetch.
   const barFor = state.lastBarTime;
   if (key === state.alertKey && barFor === state.alertsBarFor) {
     renderLastSignal(last);
@@ -548,6 +572,7 @@ async function syncAlerts(last) {
     state.summary = data.summary || null;
     state.historyMessage = data.message || "";
     state.skipped = data.skipped || 0;
+    state.barsMessage = data.bars_message || "";
     const isNew = state.alertKey !== undefined && key && key !== state.alertKey;
     // A new alert takes the chart back from whichever older one was picked.
     if (isNew) state.selectedKey = null;
@@ -753,14 +778,19 @@ function markSelectedRow() {
   for (const tr of $("history_rows").rows) tr.classList.toggle("selected", tr.dataset.key === key);
 }
 
-function focusAlert(a) {
-  if (!chart.api || !chart.byTs.has(a.ts)) {
-    toast("That alert is older than the bars on the chart.");
-    return;
-  }
-  state.selectedKey = alertKey(a);
+// Draw this alert's levels on the chart; null goes back to the newest.
+function selectAlert(key) {
+  state.selectedKey = key;
   markSelectedRow();
   redrawOverlays();
+}
+
+function focusAlert(a) {
+  if (!chart.api || !chart.byTs.has(a.ts)) {
+    toast("That alert's bar is not on the chart.");
+    return;
+  }
+  selectAlert(alertKey(a));
   const span = chart.barSeconds;
   // Wide enough to take in the exit when there is one.
   const end = Math.max(a.ts + 20 * span, (a.exit_ts || 0) + 10 * span);
@@ -786,9 +816,12 @@ async function exportCsv() {
   button.disabled = true;
   try {
     const data = await getJSON(`/api/alerts?n=${CSV_ROWS}`);
-    const rows = visibleAlerts(data.alerts || []);
+    const all = data.alerts || [];
+    const rows = visibleAlerts(all);
     if (!rows.length) {
-      toast("No alerts to export.");
+      // With no alerts at all, the server's message says why (e.g. an unreadable log).
+      toast(all.length ? "No alerts on this side to export." : `Nothing to export: ${data.message || "no alerts"}`,
+        all.length ? "" : "fail");
       return;
     }
     const lines = [CSV_FIELDS.join(","), ...rows.map((a) => CSV_FIELDS.map((k) => csvCell(a[k])).join(","))];
@@ -802,6 +835,9 @@ async function exportCsv() {
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
+    const skipped = data.skipped
+      ? `; ${data.skipped} unreadable line${data.skipped === 1 ? "" : "s"} in the log left out` : "";
+    toast(`Exported ${rows.length} alert${rows.length === 1 ? "" : "s"}${skipped}.`, skipped ? "fail" : "ok");
   } catch (err) {
     toast(`CSV export failed: ${err.message}`, "fail");
   } finally {
@@ -1037,9 +1073,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   $("chart_fit").addEventListener("click", () => chart.api?.timeScale().fitContent());
   $("chart_latest").addEventListener("click", () => {
-    state.selectedKey = null;
-    markSelectedRow();
-    redrawOverlays();
+    selectAlert(null);
     chart.api?.timeScale().scrollToRealTime();
   });
 
