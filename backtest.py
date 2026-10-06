@@ -31,6 +31,12 @@ Entries fill at the close of the confirmation bar. One position at a time.
 When a single bar's range covers both the stop and the target, it counts as a
 loss — one bar cannot say which came first, and the optimistic reading is
 how backtests flatter themselves.
+
+Each trade is charged the bid/ask spread OANDA quoted on its entry bar, as
+spread / risk R off the result: the "net" column. Read that one. On XAU_USD
+M1 the spread is around $0.50 against a median stop of a few dollars, and
+the gross column alone once showed +0.04R for a setup that was -0.17R net.
+Slippage is still not modelled.
 """
 
 import argparse
@@ -113,14 +119,20 @@ def run(df):
             continue
 
         bar = df.iloc[i]
+        spread = bar.get("Spread", float("nan"))
         levels = signal_bot.build_sl_tp(
-            signal, bar["Close"], depth, bar["ema_mid"], bar["ema_slow"], bar["atr"]
+            signal, bar["Close"], depth, bar["ema_mid"], bar["ema_slow"], bar["atr"],
+            spread=spread,
         )
         if levels is None:
             continue
 
         sl, tp, rr, risk = levels
         outcome, exit_i = resolve(highs, lows, i, signal, sl, tp)
+        r = rr if outcome == "win" else (-1.0 if outcome == "loss" else 0.0)
+        # Unknown spread is charged nothing, so a frame without bid/ask
+        # reads net == gross rather than failing.
+        cost = float(spread) / risk if pd.notna(spread) else 0.0
         trades.append(
             {
                 "entry_time": df.index[i],
@@ -133,8 +145,10 @@ def run(df):
                 "sl": round(float(sl), 2),
                 "tp": round(float(tp), 2),
                 "risk": round(float(risk), 2),
+                "spread": None if pd.isna(spread) else round(float(spread), 3),
                 "outcome": outcome,
-                "r": rr if outcome == "win" else (-1.0 if outcome == "loss" else 0.0),
+                "r": r,
+                "r_net": r - cost if outcome != "open" else 0.0,
                 "bars_held": None if exit_i is None else exit_i - i,
             }
         )
@@ -150,9 +164,10 @@ def summarise(label, rows):
     wins = sum(1 for t in closed if t["outcome"] == "win")
     win_rate = (wins / len(closed) * 100) if closed else 0.0
     expectancy = (sum(t["r"] for t in closed) / len(closed)) if closed else 0.0
+    net = (sum(t["r_net"] for t in closed) / len(closed)) if closed else 0.0
     return (
         f"  {label:<22} {len(rows):>5}  {win_rate:>6.1f}%  {expectancy:>+7.2f}R  "
-        f"{sum(t['r'] for t in closed):>+8.1f}R"
+        f"{net:>+7.2f}R  {sum(t['r_net'] for t in closed):>+8.1f}R"
     )
 
 
@@ -179,6 +194,11 @@ def report(trades, df, args):
         f"short_max_depth={signal_bot.SHORT_MAX_DEPTH} "
         f"rr={signal_bot.RR}"
     )
+    print(
+        f"  stops: stop_ref={signal_bot.STOP_REF} "
+        f"sl_buffer_atr={signal_bot.SL_BUFFER_ATR} "
+        f"min_risk_spreads={signal_bot.MIN_RISK_SPREADS}"
+    )
     print("=" * 74)
 
     if not trades:
@@ -189,7 +209,7 @@ def report(trades, df, args):
     closed = [t for t in trades if t["outcome"] != "open"]
     still_open = len(trades) - len(closed)
 
-    print(f"\n  {'':<22} {'n':>5}  {'win%':>7}  {'exp':>8}  {'total':>9}")
+    print(f"\n  {'':<22} {'n':>5}  {'win%':>7}  {'gross':>8}  {'net':>8}  {'net tot':>9}")
     print(summarise("ALL", trades))
     print()
     for direction in ("BUY", "SELL"):
@@ -209,6 +229,8 @@ def report(trades, df, args):
     actual = (sum(1 for t in closed if t["outcome"] == "win") / len(closed) * 100
               if closed else 0.0)
     held = [t["bars_held"] for t in closed if t["bars_held"] is not None]
+    spreads = sorted(t["spread"] for t in trades if t["spread"] is not None)
+    risks = sorted(t["risk"] for t in trades)
 
     print()
     print(f"  breakeven win rate at {signal_bot.RR}R : {breakeven:.1f}%  "
@@ -217,9 +239,14 @@ def report(trades, df, args):
     mean_held = f"{sum(held) / len(held):.1f}" if held else "n/a"
     print(f"  mean bars held              : {mean_held}")
     print(f"  still open at the end       : {still_open}")
+    print(f"  median risk                 : {risks[len(risks) // 2]:.2f}")
+    if spreads:
+        print(f"  median spread at entry      : {spreads[len(spreads) // 2]:.3f}")
+    else:
+        print("  median spread at entry      : unknown (no bid/ask; net == gross)")
     print()
-    print("  Costs are not modelled. Spread and slippage come straight off the")
-    print("  expectancy above, and at 1.5R they are not a rounding error.")
+    print("  Net charges each trade its entry-bar spread. Slippage is not")
+    print("  modelled and comes straight off the net expectancy above.")
     print()
 
     if args.csv:

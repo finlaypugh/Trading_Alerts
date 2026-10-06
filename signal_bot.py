@@ -22,11 +22,14 @@ Arrow convention: green marks a swing LOW (a down fractal) and is the long
 trigger; red marks a swing HIGH (an up fractal) and is the short trigger.
 Inverting this inverts every signal the bot produces, so it has its own test.
 
-Stops reference the EMA one step beyond the deepest one price breached — a
-shallow pullback to the fast EMA stops below the mid, a deeper one to the mid
-stops below the slow — offset by SL_BUFFER_ATR × ATR so the stop is not
-sitting exactly on a line that price routinely wicks. Targets are a fixed
-RR multiple of that risk.
+Stops go beyond the slow EMA, offset by SL_BUFFER_ATR × ATR so the stop is
+not sitting exactly on a line that price routinely wicks. The slow EMA is the
+line the setup itself is invalidated by, so the stop sits there for every
+depth: a shallow pullback that deepens to the mid EMA has become a depth-2
+setup, not a failed one. Targets are a fixed RR multiple of that risk.
+
+Setups whose stop is only a few spreads wide are refused. Spread is paid once
+per trade whatever the stop, so on a tight stop it eats most of the edge.
 
 Three things this bot has to get right that a naive implementation does not:
 
@@ -43,7 +46,8 @@ Three things this bot has to get right that a naive implementation does not:
     break are discarded and pullback episodes reset across one, otherwise the
     first bar after the weekend reliably fakes a pivot.
 
-Candles come from OANDA's v3 REST API (mid prices). The only endpoint this
+Candles come from OANDA's v3 REST API (mid prices, with the bid/ask spread
+alongside). The only endpoint this
 script calls is the candles one. OANDA tokens are not read-only, so use one
 from a practice account: its candles are the same, and it has no real money
 behind it. This script never places trades — it only sends notifications
@@ -111,6 +115,19 @@ SHORT_MAX_DEPTH = int(os.environ.get("SIGNAL_SHORT_MAX_DEPTH", 2))
 # Risk
 RR = float(os.environ.get("SIGNAL_RR", 1.5))
 SL_BUFFER_ATR = float(os.environ.get("SIGNAL_SL_BUFFER_ATR", 0.25))
+
+# Which EMA the stop goes beyond. "slow" (default) uses the slow EMA, the
+# setup's own invalidation line, for every depth. "tiered" is the old rule:
+# a depth-1 pullback stops beyond the mid EMA. On 60 days of XAU_USD M1 and
+# 180 days of M5 the tiered depth-1 stop was the worst-performing slice: the
+# mid EMA is an ordinary retracement level, so it stopped out trades the
+# setup's own rules still considered valid.
+STOP_REF = os.environ.get("SIGNAL_STOP_REF", "slow").lower()
+
+# Refuse a setup whose risk is less than this many bid/ask spreads. Spread is
+# paid once per trade, so a stop 3 spreads wide starts a third of an R down.
+# 0 = off. Needs the Spread column fetch_candles supplies.
+MIN_RISK_SPREADS = float(os.environ.get("SIGNAL_MIN_RISK_SPREADS", 6.0))
 MIN_STACK_SEP_ATR = float(os.environ.get("SIGNAL_MIN_STACK_SEP_ATR", 0.0))
 MAX_RISK_ATR = float(os.environ.get("SIGNAL_MAX_RISK_ATR", 0.0))  # 0 = no ceiling
 ATR_LEN = int(os.environ.get("SIGNAL_ATR_LEN", 14))
@@ -132,6 +149,8 @@ if FRACTAL_N < 2:
     )
 if FRACTAL_MAX_PLATEAU < 0:
     raise ValueError(f"SIGNAL_FRACTAL_MAX_PLATEAU must be >= 0 (got {FRACTAL_MAX_PLATEAU})")
+if STOP_REF not in ("slow", "tiered"):
+    raise ValueError(f"SIGNAL_STOP_REF must be 'slow' or 'tiered' (got {STOP_REF!r})")
 if not (EMA_FAST < EMA_MID < EMA_SLOW):
     raise ValueError(
         f"EMA lengths must satisfy fast < mid < slow "
@@ -207,7 +226,8 @@ def to_utc(value):
 def fetch_candles(instrument, granularity, start, end, token=None, environment=None):
     """
     Closed mid-price candles for [start, end] from OANDA, as an OHLCV frame
-    indexed by UTC time.
+    indexed by UTC time, plus a Spread column: ask close minus bid close, NaN
+    for a candle OANDA sent no bid/ask for.
 
     The candles endpoint rejects `count` sent together with both `from` and
     `to`, so every page is `from` + `count` and the cursor walks forward from
@@ -234,7 +254,7 @@ def fetch_candles(instrument, granularity, start, end, token=None, environment=N
     while True:
         resp = requests.get(
             url, headers=headers, timeout=30,
-            params={"granularity": granularity, "price": "M",
+            params={"granularity": granularity, "price": "MBA",
                     "from": cursor.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
                     "count": OANDA_PAGE_SIZE},
         )
@@ -247,11 +267,15 @@ def fetch_candles(instrument, granularity, start, end, token=None, environment=N
             break
         for c in candles:
             mid = c["mid"]
+            if "bid" in c and "ask" in c:
+                spread = float(c["ask"]["c"]) - float(c["bid"]["c"])
+            else:
+                spread = float("nan")
             rows.append({
                 "time": c["time"], "complete": c["complete"],
                 "Open": float(mid["o"]), "High": float(mid["h"]),
                 "Low": float(mid["l"]), "Close": float(mid["c"]),
-                "Volume": int(c["volume"]),
+                "Volume": int(c["volume"]), "Spread": spread,
             })
         last = to_utc(candles[-1]["time"])
         if last >= end or len(candles) < OANDA_PAGE_SIZE:
@@ -832,16 +856,23 @@ def detect_signal(df):
     return signal, strength, "STRONG", depth, reason
 
 
-def build_sl_tp(signal, price, depth, ema_mid, ema_slow, atr):
+def stop_ref_len(depth):
+    """Length of the EMA a pullback of this depth puts its stop beyond."""
+    return EMA_MID if (STOP_REF == "tiered" and depth == 1) else EMA_SLOW
+
+
+def build_sl_tp(signal, price, depth, ema_mid, ema_slow, atr, spread=None):
     """
-    Stop goes one EMA beyond the deepest one price breached, offset by a
-    fraction of ATR so it is not sitting exactly on a line price wicks.
-    Target is a fixed RR multiple of that risk.
+    Stop goes beyond the slow EMA (with STOP_REF="tiered", the mid EMA for a
+    depth-1 pullback), offset by a fraction of ATR so it is not sitting
+    exactly on a line price wicks. Target is a fixed RR multiple of that risk.
 
     Returns (sl, tp, rr, risk), or None when the stop would land on the wrong
-    side of entry — which happens on fast moves and must not become an alert.
+    side of entry — which happens on fast moves and must not become an alert —
+    or when risk is under MIN_RISK_SPREADS spreads. An unknown spread (None
+    or NaN) skips that check rather than refusing the trade.
     """
-    ref = ema_mid if depth == 1 else ema_slow
+    ref = ema_mid if stop_ref_len(depth) == EMA_MID else ema_slow
     buf = SL_BUFFER_ATR * atr
 
     if signal == "BUY":
@@ -855,6 +886,9 @@ def build_sl_tp(signal, price, depth, ema_mid, ema_slow, atr):
         return None
     if MAX_RISK_ATR > 0 and pd.notna(atr) and atr > 0 and risk > MAX_RISK_ATR * atr:
         return None
+    if (MIN_RISK_SPREADS > 0 and spread is not None and pd.notna(spread)
+            and spread > 0 and risk < MIN_RISK_SPREADS * spread):
+        return None
 
     tp = price + RR * risk if signal == "BUY" else price - RR * risk
     return sl, tp, RR, risk
@@ -865,7 +899,7 @@ def send_discord_alert(signal, price, atr, strength, tier, depth, reason,
     emoji = "\U0001F7E2" if signal == "BUY" else "\U0001F534"
     stars = "⭐" * max(1, round(strength * 5))
     order = ">" if signal == "BUY" else "<"
-    stop_ref = EMA_MID if depth == 1 else EMA_SLOW
+    stop_ref = stop_ref_len(depth)
     content = (
         f"{emoji} **{tier} {signal}** {TICKER} @ {price:,.2f}\n"
         f"{reason}\n"
@@ -887,7 +921,7 @@ def send_startup_message():
         f"Trigger: Williams Fractals (n={FRACTAL_N}) after pullback to the "
         f"{EMA_FAST} or {EMA_MID}\n"
         f"Veto: any close beyond the {EMA_SLOW} kills the setup\n"
-        f"Stop: beyond the {EMA_MID}/{EMA_SLOW} by {SL_BUFFER_ATR}×ATR | "
+        f"Stop: beyond the {stop_ref_len(1)}/{stop_ref_len(2)} by {SL_BUFFER_ATR}×ATR | "
         f"Target: {RR}R\n"
         f"Polling every {POLL_SECONDS}s | closed candles only"
     )
@@ -996,13 +1030,16 @@ def _poll(status):
             return "suppressed"
 
     latest = df.iloc[-1]
+    spread = latest.get("Spread")
     levels = build_sl_tp(
-        signal, latest["Close"], depth, latest["ema_mid"], latest["ema_slow"], latest["atr"]
+        signal, latest["Close"], depth, latest["ema_mid"], latest["ema_slow"],
+        latest["atr"], spread=spread,
     )
     if levels is None:
         print(
-            f"[{TICKER}] {tier} {signal} skipped: stop would sit on the wrong side "
-            f"of entry (price {latest['Close']:.2f}, depth {depth})"
+            f"[{TICKER}] {tier} {signal} skipped: stop on the wrong side of entry "
+            f"or too tight for the spread (price {latest['Close']:.2f}, depth {depth}, "
+            f"spread {_finite(spread)})"
         )
         return "refused"
 
@@ -1053,7 +1090,7 @@ if __name__ == "__main__":
         f"Trend: EMA {EMA_FAST}/{EMA_MID}/{EMA_SLOW} stacked | "
         f"Trigger: Williams Fractals (n={FRACTAL_N}) after a pullback | "
         f"Veto: any close beyond the {EMA_SLOW} | "
-        f"Stop beyond the {EMA_MID}/{EMA_SLOW}, target {RR}R | "
+        f"Stop beyond the {stop_ref_len(1)}/{stop_ref_len(2)}, target {RR}R | "
         f"closed candles only | polling every {POLL_SECONDS}s"
     )
     send_startup_message()

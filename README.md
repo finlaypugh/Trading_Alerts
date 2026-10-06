@@ -168,6 +168,17 @@ Read these before trusting an alert.
   the stack to have held its order for three closed bars;
   `SIGNAL_MIN_STACK_SEP_ATR` (off by default) is the separate knob for a fan
   that is ordered but too tight.
+- **Every stop goes beyond the 100.** The source stops a pullback to the 20
+  below the 50. But the setup is only dead on a close beyond the 100, and a
+  pullback that carries on to the 50 is the source's own depth-2 entry, so
+  the 50 stop was closing trades the rules still called valid. Depth 1 was
+  the worst slice in every backtest run: yfinance 15m, OANDA M1 and OANDA
+  M5. `SIGNAL_STOP_REF=tiered` restores the source's rule.
+- **Stops too tight for the spread are refused.** Spread is paid once per
+  trade, whatever the stop. On gold M1 it is about $0.50 against stops of a
+  few dollars, which put a fifth of an R of cost on the median trade before
+  it started. `SIGNAL_MIN_RISK_SPREADS=6` refuses a setup whose risk is under
+  six of the entry bar's spreads.
 - **Session gaps.** Gold has a daily break and weekends. Pivots
   whose window straddles a break are discarded and pullback episodes reset
   across one, otherwise the first bar back after the weekend reliably fakes a
@@ -209,6 +220,32 @@ python backtest.py --granularity M15 --csv trades.csv
 Entries fill at the close of the confirmation bar, one position at a time,
 honouring `SIGNAL_COOLDOWN_BARS`. When one bar's range covers both the stop
 and the target it is scored as a loss — one bar cannot say which came first.
+
+Each trade is charged the bid/ask spread OANDA quoted on its entry bar, as
+`spread / risk` R. The **net** column is the one to read; gross is there to
+show how much the spread costs. Slippage is still not modelled. Any
+`SIGNAL_*` variable can be set on the command line to compare rules:
+
+```bash
+SIGNAL_STOP_REF=tiered SIGNAL_MIN_RISK_SPREADS=0 python backtest.py   # the old stop rules
+```
+
+**Result, OANDA `XAU_USD`, real per-bar spread (2026-10-06):**
+
+| | rules | trades | win rate | gross | net |
+|---|---|---|---|---|---|
+| M1, 60 days | old (50-EMA depth-1 stop, no spread floor) | 1,097 | 41.6% | +0.04R | −0.19R |
+| M1, 60 days | current | 529 | 42.3% | +0.06R | −0.03R |
+| M5, 180 days | old | 648 | 36.3% | −0.09R | −0.20R |
+| M5, 180 days | current | 388 | 44.3% | +0.11R | +0.05R |
+
+Under the old rules, 1m looked break-even gross and lost a fifth of an R per
+trade once spread was counted. The two changes held up in both halves of each
+window, not just overall. A breakeven stop at +1R, other RR targets, wider
+ATR buffers, and session-hour filters were tried as well and did not hold up
+across both windows. **M1 is still slightly negative after costs; M5 is
+slightly positive.** Neither is a proven edge, and slippage on manual entries
+comes on top.
 
 **Result, `GC=F` 15m via yfinance, 3,993 bars (2026-07-06 to 2026-09-03),
 before the switch to OANDA:**
@@ -252,8 +289,8 @@ is the annotated copy; this table is the complete list.
 | `SIGNAL_INTERVAL` | `1m` | Bar size: `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`. |
 | `SIGNAL_LOOKBACK` | `3d` | History pulled each poll (`m`/`h`/`d`). Must clear the EMA warm-up, weekend included. |
 | `SIGNAL_EMA_FAST` | `20` | Fast EMA. |
-| `SIGNAL_EMA_MID` | `50` | Mid EMA. Depth-1 stop reference. |
-| `SIGNAL_EMA_SLOW` | `100` | Slow EMA. Depth-2 stop reference, and the veto line. |
+| `SIGNAL_EMA_MID` | `50` | Mid EMA. Depth-1 stop reference only with `SIGNAL_STOP_REF=tiered`. |
+| `SIGNAL_EMA_SLOW` | `100` | Slow EMA. Stop reference, and the veto line. |
 | `SIGNAL_FRACTAL_N` | `2` | Bars either side of a pivot. Also the confirmation lag. |
 | `SIGNAL_FRACTAL_MAX_PLATEAU` | `4` | Equal bars tolerated on a pivot's left side. |
 | `SIGNAL_PULLBACK_EXPIRY_BARS` | `3` | Bars back above the fast EMA that close an episode. |
@@ -263,6 +300,8 @@ is the annotated copy; this table is the complete list.
 | `SIGNAL_SHORT_MAX_DEPTH` | `2` | `1` restricts shorts to the pullback-above-20 entry. |
 | `SIGNAL_RR` | `1.5` | Target as a multiple of risk. |
 | `SIGNAL_SL_BUFFER_ATR` | `0.25` | Stop offset beyond the reference EMA, in ATRs. |
+| `SIGNAL_STOP_REF` | `slow` | `slow`: every stop goes beyond the slow EMA. `tiered`: the source's rule, depth 1 stops beyond the mid. |
+| `SIGNAL_MIN_RISK_SPREADS` | `6.0` | Refuse a setup whose risk is under this many bid/ask spreads. `0` = off. |
 | `SIGNAL_MIN_STACK_SEP_ATR` | `0.0` | Minimum fast-to-slow separation, in ATRs. `0` = off. |
 | `SIGNAL_MAX_RISK_ATR` | `0.0` | Reject setups whose stop is wider than this. `0` = off. |
 | `SIGNAL_ATR_LEN` | `14` | ATR period (Wilder smoothing). |

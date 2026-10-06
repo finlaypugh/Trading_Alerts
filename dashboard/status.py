@@ -60,6 +60,8 @@ CONFIG_KEYS = {
     "short_max_depth": "SHORT_MAX_DEPTH",
     "rr": "RR",
     "sl_buffer_atr": "SL_BUFFER_ATR",
+    "stop_ref": "STOP_REF",
+    "min_risk_spreads": "MIN_RISK_SPREADS",
     "min_stack_sep_atr": "MIN_STACK_SEP_ATR",
     "max_risk_atr": "MAX_RISK_ATR",
     "atr_len": "ATR_LEN",

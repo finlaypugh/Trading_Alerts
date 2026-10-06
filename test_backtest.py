@@ -47,9 +47,10 @@ class FakeOanda:
     before `from`, the way adjacent pages can share a boundary candle.
     """
 
-    def __init__(self, n, overlap=False):
+    def __init__(self, n, overlap=False, spread=None):
         self.times = pd.date_range(T0, periods=n, freq="1min")
         self.overlap = overlap
+        self.spread = spread
         self.calls = []
 
     def get(self, url, headers=None, params=None, timeout=None):
@@ -72,6 +73,11 @@ class FakeOanda:
             }
             for k, t in enumerate(page)
         ]
+        if self.spread is not None:
+            for c in candles:
+                close = float(c["mid"]["c"])
+                c["bid"] = {"c": f"{close - self.spread / 2}"}
+                c["ask"] = {"c": f"{close + self.spread / 2}"}
         return FakeResponse(200, {"candles": candles})
 
 
@@ -89,8 +95,8 @@ class FakeResponse:
 @pytest.fixture
 def oanda(monkeypatch):
     """Install a FakeOanda; call the returned factory with (n, overlap)."""
-    def install(n, overlap=False, page_size=None):
-        fake = FakeOanda(n, overlap)
+    def install(n, overlap=False, page_size=None, spread=None):
+        fake = FakeOanda(n, overlap, spread)
         monkeypatch.setattr(signal_bot.requests, "get", fake.get)
         if page_size is not None:
             monkeypatch.setattr(signal_bot, "OANDA_PAGE_SIZE", page_size)
@@ -151,9 +157,69 @@ class TestFetchHistory:
     def test_output_is_what_compute_indicators_expects(self, oanda):
         oanda(20)
         df = fetch(end=T0 + pd.Timedelta(hours=1))
-        assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
+        assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume", "Spread"]
         assert str(df.index.tz) == "UTC"
         assert df["Close"].dtype == float
+
+    def test_asks_for_bid_and_ask_alongside_mid(self, oanda):
+        fake = oanda(20)
+        fetch(end=T0 + pd.Timedelta(hours=1))
+        assert fake.calls[0]["price"] == "MBA"
+
+    def test_spread_is_ask_close_minus_bid_close(self, oanda):
+        oanda(20, spread=0.5)
+        df = fetch(end=T0 + pd.Timedelta(hours=1))
+        assert df["Spread"].to_numpy() == pytest.approx([0.5] * len(df))
+
+    def test_spread_is_nan_when_oanda_sends_no_bid_ask(self, oanda):
+        oanda(20)
+        df = fetch(end=T0 + pd.Timedelta(hours=1))
+        assert df["Spread"].isna().all()
+
+
+# ---------------------------------------------------------------------------
+# Spread cost
+# ---------------------------------------------------------------------------
+
+def _trade(outcome, r, r_net):
+    return {"outcome": outcome, "r": r, "r_net": r_net}
+
+
+class TestNetOfSpread:
+    def test_summary_reports_net_alongside_gross(self):
+        rows = [_trade("win", 1.5, 1.4), _trade("loss", -1.0, -1.1)]
+        line = backtest.summarise("ALL", rows)
+        assert "+0.25R" in line   # gross
+        assert "+0.15R" in line   # net
+
+    def test_open_trades_are_left_out_of_net(self):
+        rows = [_trade("win", 1.5, 1.4), _trade("open", 0.0, 0.0)]
+        assert "+1.40R" in backtest.summarise("ALL", rows)
+
+    def test_run_charges_each_trade_its_entry_bar_spread(self, monkeypatch):
+        # Stub the rules so one BUY fires on the bar at index MIN_BARS - 1 and
+        # the next bar hits the target; only run()'s accounting is under test.
+        n = signal_bot.MIN_BARS + 5
+        idx = pd.date_range(T0, periods=n, freq="1min")
+        df = pd.DataFrame({
+            "Open": 100.0, "High": 100.0, "Low": 100.0, "Close": 100.0,
+            "ema_mid": 99.0, "ema_slow": 98.0, "atr": 1.0, "Spread": 0.4,
+        }, index=idx)
+        df.iloc[signal_bot.MIN_BARS, df.columns.get_loc("High")] = 200.0
+        fired = {"done": False}
+
+        def detect(window):
+            if not fired["done"] and len(window) == signal_bot.MIN_BARS:
+                fired["done"] = True
+                return "BUY", 0.8, "STRONG", 2, "r"
+            return None, 0.0, None, 0, ""
+
+        monkeypatch.setattr(signal_bot, "detect_signal", detect)
+        monkeypatch.setattr(signal_bot, "MIN_RISK_SPREADS", 0.0)
+        (trade,) = backtest.run(df)
+        assert trade["outcome"] == "win"
+        assert trade["spread"] == pytest.approx(0.4)
+        assert trade["r_net"] == pytest.approx(trade["r"] - 0.4 / trade["risk"])
 
     @pytest.mark.parametrize("end", [
         pd.Timestamp("2026-09-01 01:40", tz="Europe/London"),   # aware, not UTC
