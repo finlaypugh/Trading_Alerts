@@ -13,6 +13,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from outcomes import resolve
+
 ROOT = Path(__file__).resolve().parent.parent
 BOT_SERVICE = "signal-bot"
 
@@ -227,19 +229,71 @@ def load_bars():
     }
 
 
+def _number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def add_outcomes(alerts, bars):
+    """
+    Mark each alert win / loss / open by walking the chart bars after the bar
+    it fired on, with the backtest's own rule: the stop wins when one bar spans
+    both levels. "unknown" when that bar is older than the bars file or the
+    levels are missing. `r` is in multiples of the alert's risk; `exit_ts` is
+    the bar that hit the stop or target.
+    """
+    usable = [b for b in bars if _number(b.get("high")) and _number(b.get("low"))]
+    index = {b["ts"]: i for i, b in enumerate(usable)}
+    highs = [b["high"] for b in usable]
+    lows = [b["low"] for b in usable]
+    for a in alerts:
+        a.update(outcome="unknown", r=None, exit_ts=None)
+        price, sl, tp = a.get("price"), a.get("sl"), a.get("tp")
+        i = index.get(a.get("ts"))
+        if (i is None or a.get("signal") not in ("BUY", "SELL")
+                or not all(_number(v) for v in (price, sl, tp)) or price == sl):
+            continue
+        outcome, exit_i = resolve(highs, lows, i, a["signal"], sl, tp)
+        a["outcome"] = outcome
+        if outcome == "win":
+            a["r"] = round(abs(tp - price) / abs(price - sl), 2)
+        elif outcome == "loss":
+            a["r"] = -1.0
+        if exit_i is not None:
+            a["exit_ts"] = usable[exit_i]["ts"]
+    return alerts
+
+
+def outcome_summary(alerts):
+    """Per side: outcome counts, and win rate and net R over closed trades only."""
+    summary = {}
+    for side in ("all", "BUY", "SELL"):
+        rows = [a for a in alerts if side == "all" or a.get("signal") == side]
+        count = {k: sum(1 for a in rows if a.get("outcome") == k)
+                 for k in ("win", "loss", "open", "unknown")}
+        closed = count["win"] + count["loss"]
+        summary[side] = {
+            "wins": count["win"], "losses": count["loss"],
+            "open": count["open"], "unknown": count["unknown"],
+            "win_rate": round(count["win"] / closed, 3) if closed else None,
+            "net_r": round(sum(a["r"] for a in rows if a.get("r") is not None), 2),
+        }
+    return summary
+
+
 def load_alerts(n):
     """
     The newest n alerts from the bot's alert log, newest first, each with the
-    unix `ts` of the bar it fired on. Unparseable lines are skipped and
-    counted rather than failing the lot.
+    unix `ts` of the bar it fired on and its outcome against the chart bars.
+    Unparseable lines are skipped and counted rather than failing the lot.
     """
     path = alerts_path()
     try:
         lines = _tail_file(path, n)
     except FileNotFoundError:
-        return {"alerts": [], "skipped": 0, "message": "no alerts logged yet"}
+        return {"alerts": [], "skipped": 0, "summary": outcome_summary([]),
+                "message": "no alerts logged yet"}
     except OSError as exc:
-        return {"alerts": [], "skipped": 0,
+        return {"alerts": [], "skipped": 0, "summary": outcome_summary([]),
                 "message": f"{path.name} unreadable: {type(exc).__name__}"}
     alerts, skipped = [], 0
     for line in reversed(lines):
@@ -254,9 +308,11 @@ def load_alerts(n):
             continue
         alerts.append({**{k: _clean(raw.get(k)) for k in ALERT_FIELDS},
                        "ts": _epoch(raw.get("bar_time"))})
+    add_outcomes(alerts, load_bars()["bars"])
     return {
         "alerts": alerts,
         "skipped": skipped,
+        "summary": outcome_summary(alerts),
         "message": None if alerts else "no alerts logged yet",
     }
 
