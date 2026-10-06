@@ -898,3 +898,135 @@ def test_chart_library_is_served_locally(client):
     assert resp.mimetype in ("text/javascript", "application/javascript")
     assert b"Lightweight Charts" in resp.get_data()[:300]
     resp.close()
+
+
+# ---------------------------------------------------------------------------
+# Durable alert log: logged outcomes and bucket stats
+# ---------------------------------------------------------------------------
+
+import alert_log  # noqa: E402
+
+
+def log_rows(*rows, source="live"):
+    conn = alert_log.connect(status.db_path())
+    try:
+        defaults = {c: None for c in alert_log.COLUMNS}
+        defaults.update(source=source, ticker="TESTTICKER", interval="1m", signal="BUY",
+                        depth=1, outcome="win", r=1.5)
+        alert_log.insert(conn, [{**defaults, **r} for r in rows])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def logged(i, **fields):
+    t = f"2026-10-0{1 + i // 1440}T{(i // 60) % 24:02d}:{i % 60:02d}:00+00:00"
+    row = {"bar_time": t, "exit_time": t,
+           "alert_id": alert_log.make_alert_id("TESTTICKER", fields.get("signal", "BUY"), t)}
+    row.update(fields)
+    return row
+
+
+class TestLoggedOutcomes:
+    def test_resolved_outcome_replaces_unknown_for_an_old_alert(self, client):
+        write_bars([quiet(55), quiet(56)])
+        write_alerts(TestOutcomes.BUY)
+        log_rows({"bar_time": "2026-10-05T11:50:00+00:00", "exit_time": "2026-10-05T11:53:00+00:00",
+                  "alert_id": "TESTTICKER|BUY|2026-10-05T11:50:00+00:00", "r": 1.5})
+        (alert,) = client.get("/api/alerts").json["alerts"]
+        assert (alert["outcome"], alert["r"], alert["unknown_reason"]) == ("win", 1.5, None)
+        assert alert["exit_ts"] == status._epoch(minute(53))
+
+    def test_open_or_pending_log_rows_do_not_override(self, client):
+        write_bars([quiet(50), quiet(51)])
+        write_alerts(TestOutcomes.BUY)
+        log_rows({"bar_time": "2026-10-05T11:50:00+00:00", "outcome": "pending", "r": None,
+                  "alert_id": "TESTTICKER|BUY|2026-10-05T11:50:00+00:00"})
+        assert client.get("/api/alerts").json["alerts"][0]["outcome"] == "open"
+
+    def test_a_logged_alert_id_wins_over_a_computed_one(self, client):
+        write_alerts(dict(TestOutcomes.BUY, alert_id="custom-id"))
+        log_rows({"bar_time": "2026-10-05T11:50:00+00:00", "alert_id": "custom-id",
+                  "outcome": "loss", "r": -1.0})
+        assert client.get("/api/alerts").json["alerts"][0]["outcome"] == "loss"
+
+    def test_backtest_rows_never_override_live_history(self, client):
+        write_alerts(TestOutcomes.BUY)
+        log_rows({"bar_time": "2026-10-05T11:50:00+00:00",
+                  "alert_id": "TESTTICKER|BUY|2026-10-05T11:50:00+00:00"}, source="backtest:x")
+        assert client.get("/api/alerts").json["alerts"][0]["outcome"] == "unknown"
+
+    def test_unreadable_log_leaves_the_bars_view_alone(self, client):
+        status.db_path().write_text("this is not sqlite")
+        write_bars([quiet(50), quiet(51, high=11.6)])
+        write_alerts(TestOutcomes.BUY)
+        resp = client.get("/api/alerts")
+        assert resp.status_code == 200
+        assert resp.json["alerts"][0]["outcome"] == "win"
+
+
+class TestStats:
+    def test_no_log_yet_is_a_message_not_a_500(self, client):
+        resp = client.get("/api/stats")
+        assert resp.status_code == 200
+        assert resp.json["buckets"] == []
+        assert "no alert log yet" in resp.json["message"]
+
+    @pytest.mark.parametrize("query", ["by=nonsense", "source=everything"])
+    def test_unknown_dimension_or_source(self, client, query):
+        log_rows(logged(0))
+        data = client.get(f"/api/stats?{query}").json
+        assert data["buckets"] == []
+        assert "unknown" in data["message"]
+
+    def test_buckets_by_depth_with_noise_flag(self, client, monkeypatch):
+        monkeypatch.setenv("STATS_MIN_N", "3")
+        log_rows(*[logged(i, depth=1) for i in range(3)],
+                 *[logged(10 + i, depth=2, outcome="loss", r=-1.0) for i in range(2)])
+        data = client.get("/api/stats?by=depth").json
+        assert data["message"] is None
+        assert data["n"] == 5
+        assert data["k"] == 2
+        assert data["breakeven_win_rate"] == 0.4
+        d1, d2 = data["buckets"]
+        assert (d1["bucket_id"], d1["n"], d1["win_rate"], d1["noise"]) == ("depth=1", 3, 1.0, False)
+        assert (d2["bucket_id"], d2["n"], d2["mean_r"], d2["noise"]) == ("depth=2", 2, -1.0, True)
+        assert d2["sig_negative"] is False
+
+    def test_only_the_running_config_counts(self, client):
+        write_status(config_hash="new")
+        log_rows(logged(0, config_hash="old"), logged(1, config_hash="new", outcome="loss", r=-1.0))
+        data = client.get("/api/stats?by=signal").json
+        assert data["config_hash"] == "new"
+        assert data["n"] == 1
+        assert data["buckets"][0]["mean_r"] == -1.0
+
+    def test_no_rows_under_the_current_config_says_so(self, client):
+        write_status(config_hash="new")
+        log_rows(logged(0, config_hash="old"))
+        assert "current config" in client.get("/api/stats").json["message"]
+
+    def test_backtest_source_is_the_latest_run_only(self, client):
+        log_rows(logged(0))
+        log_rows(logged(0), logged(1), source="backtest:2026-10-01T00:00:00+00:00")
+        log_rows(logged(0, outcome="loss", r=-1.0), source="backtest:2026-10-02T00:00:00+00:00")
+        data = client.get("/api/stats?by=signal&source=backtest").json
+        assert data["source"] == "backtest:2026-10-02T00:00:00+00:00"
+        assert data["n"] == 1
+
+    def test_backtest_source_without_a_run(self, client):
+        log_rows(logged(0))
+        assert "backtest.py --db" in client.get("/api/stats?source=backtest").json["message"]
+
+    def test_the_page_offers_every_dimension(self, client):
+        html = client.get("/").get_data(as_text=True)
+        for dim in alert_log.DIMENSIONS:
+            assert f'value="{dim}"' in html
+
+    def test_anthropic_key_is_treated_as_a_secret(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-123456")
+        assert "sk-ant" not in status.redact("key sk-ant-test-key-123456 leaked")
+
+    def test_status_carries_the_config_hash(self, client):
+        write_status(config_hash="abc123")
+        assert client.get("/api/status").json["status"]["config_hash"] == "abc123"

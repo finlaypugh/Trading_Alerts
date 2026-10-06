@@ -26,3 +26,18 @@ def resolve(highs, lows, entry_i, signal, sl, tp):
         if hit_tp:
             return "win", j
     return "open", None
+
+
+def r_multiple(outcome, entry, sl, tp):
+    """
+    A closed trade's result in multiples of its risk: the reward/risk ratio
+    for a win, -1 for a loss. None for anything not closed, or with no risk.
+    """
+    if outcome == "loss":
+        return -1.0
+    if outcome != "win":
+        return None
+    risk = abs(entry - sl)
+    if not risk:
+        return None
+    return abs(tp - entry) / risk

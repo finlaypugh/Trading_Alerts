@@ -107,6 +107,13 @@ def api_alerts():
     return jsonify(status.load_alerts(max(1, min(n, MAX_ALERTS))))
 
 
+@app.get("/api/stats")
+def api_stats():
+    return jsonify(status.load_stats(
+        request.args.get("by", "depth"), request.args.get("source", "live"),
+    ))
+
+
 @app.get("/api/config")
 def api_config():
     return jsonify(status.bot_config())

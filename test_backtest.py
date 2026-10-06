@@ -215,3 +215,65 @@ class TestGranularity:
             cwd=Path(__file__).parent, check=True,
         ).stdout.split()
         assert out == ["1m", "XAU_USD", "M1"]
+
+
+# ---------------------------------------------------------------------------
+# Trade list and the alert log
+# ---------------------------------------------------------------------------
+
+def signal_frame(n, entry_at, exit_high=127.0):
+    """
+    Indicator frame with one BUY setup at bar `entry_at`: close 112 over a
+    105/100 stack with ATR 10 puts the stop at 102.5 and the target at
+    126.25. The bar after reaches `exit_high`.
+    """
+    idx = pd.date_range("2026-09-01", periods=n, freq="1min", tz="UTC")
+    df = pd.DataFrame({
+        "High": 113.0, "Low": 111.0, "Close": 112.0,
+        "ema_fast": 110.0, "ema_mid": 105.0, "ema_slow": 100.0, "atr": 10.0,
+        "bull_stack_bars": 42, "bear_stack_bars": 0,
+    }, index=idx)
+    df.iloc[entry_at + 1, df.columns.get_loc("High")] = exit_high
+    return df
+
+
+class TestTradeColumns:
+    @pytest.fixture
+    def one_trade(self, monkeypatch):
+        entry_at = signal_bot.MIN_BARS + 2
+        df = signal_frame(entry_at + 5, entry_at)
+        monkeypatch.setattr(
+            signal_bot, "detect_signal",
+            lambda w: ("BUY", 0.8, "STRONG", 1, "r") if len(w) == entry_at + 1
+            else (None, 0.0, None, 0, ""),
+        )
+        (trade,) = backtest.run(df)
+        return trade
+
+    def test_carries_the_context_the_live_bot_logs(self, one_trade):
+        assert one_trade["atr"] == 10.0
+        assert (one_trade["ema_fast"], one_trade["ema_mid"], one_trade["ema_slow"]) == \
+            (110.0, 105.0, 100.0)
+        assert one_trade["stack_bars"] == 42
+        assert one_trade["bars_since_last_alert"] is None
+        assert one_trade["config_hash"] == signal_bot.config_hash()
+
+    def test_r_is_the_shared_r_multiple(self, one_trade):
+        assert one_trade["outcome"] == "win"
+        assert one_trade["r"] == round(backtest.r_multiple(
+            "win", one_trade["entry"], one_trade["sl"], one_trade["tp"]), 2)
+        assert one_trade["r"] == signal_bot.RR
+
+    def test_write_db_keeps_backtest_rows_apart_from_live(self, one_trade, tmp_path):
+        db = tmp_path / ".alerts_X.db"
+        source = backtest.write_db([one_trade], "XAU_USD", "1m", path=db,
+                                   now=pd.Timestamp("2026-10-06 12:00", tz="UTC"))
+        assert source == "backtest:2026-10-06T12:00:00+00:00"
+        conn = backtest.alert_log.connect(db)
+        try:
+            assert backtest.alert_log.load_rows(conn, "live") == []
+            (row,) = backtest.alert_log.load_rows(conn, source)
+        finally:
+            conn.close()
+        assert (row["outcome"], row["r"], row["stack_bars"], row["ticker"]) == \
+            ("win", 1.5, 42, "XAU_USD")

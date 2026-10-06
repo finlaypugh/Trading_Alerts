@@ -58,6 +58,7 @@ Setup:
 Config is via environment variables (see the block below).
 """
 
+import hashlib
 import json
 import math
 import os
@@ -69,6 +70,8 @@ from urllib.parse import urlsplit
 
 import pandas as pd
 import requests
+
+import alert_log
 
 # ---- Config (override via environment variables) ----
 TICKER = os.environ.get("SIGNAL_TICKER", "")                 # OANDA instrument, e.g. XAU_USD
@@ -161,6 +164,22 @@ ALERTS_KEEP = 500
 # Enough history for the slowest EMA to settle, plus a full fractal window
 # (n bars either side of a pivot, plus the n-bar confirmation delay).
 MIN_BARS = max(EMA_SLOW * 2, ATR_LEN * 2, (2 * FRACTAL_N) + 1 + FRACTAL_N)
+
+
+def config_hash():
+    """
+    Short fingerprint of every setting that changes which alerts fire or
+    where their levels sit. Logged with each alert so outcome statistics are
+    never pooled across configs. Read at call time, not import, because the
+    backtest overrides some of these after importing this module.
+    """
+    knobs = [
+        INTERVAL, EMA_FAST, EMA_MID, EMA_SLOW, FRACTAL_N, FRACTAL_MAX_PLATEAU,
+        PULLBACK_EXPIRY_BARS, REQUIRE_PULLBACK, REQUIRE_PIVOT_IN_PULLBACK,
+        MIN_STACK_BARS, SHORT_MAX_DEPTH, RR, SL_BUFFER_ATR, MIN_STACK_SEP_ATR,
+        MAX_RISK_ATR, ATR_LEN, DROP_UNCLOSED_BAR, SESSION_GAP_MULT, COOLDOWN_BARS,
+    ]
+    return hashlib.sha256(json.dumps(knobs).encode()).hexdigest()[:12]
 
 
 def interval_minutes(interval=None):
@@ -359,6 +378,7 @@ def write_status(**fields):
             "ticker": TICKER,
             "interval": INTERVAL,
             "poll_seconds": POLL_SECONDS,
+            "config_hash": config_hash(),
             **fields,
         }
         _atomic_write(STATUS_FILE, json.dumps(payload, default=str, allow_nan=False))
@@ -432,6 +452,43 @@ def append_alert(**fields):
             f"[{TICKER}] failed to log {fields.get('signal')} alert for bar "
             f"{fields.get('bar_time')} to the alert history: {type(exc).__name__}: {exc}"
         )
+
+
+ALERT_CONTEXT_FIELDS = (
+    "alert_id", "ticker", "interval", "config_hash", "atr",
+    "ema_fast", "ema_mid", "ema_slow", "stack_bars", "bars_since_last_alert",
+)
+
+
+def _alert_context(df, last, signal):
+    """
+    What else the alert log records about a sent alert, for outcome analysis:
+    its id, the config it fired under, ATR and EMAs at the bar, how long the
+    stack had held, and how many bars since the previous alert (None when
+    there was none, or it is older than this frame). Read-only; never raises,
+    since it runs after the alert has already gone out.
+    """
+    try:
+        curr = df.iloc[-1]
+        since = bars_since(df, last["bar_time"]) if last else None
+        if since is not None and since >= len(df):
+            since = None
+        stack_col = "bull_stack_bars" if signal == "BUY" else "bear_stack_bars"
+        return {
+            "alert_id": alert_log.make_alert_id(TICKER, signal, df.index[-1]),
+            "ticker": TICKER,
+            "interval": INTERVAL,
+            "config_hash": config_hash(),
+            "atr": _finite(curr.get("atr")),
+            "ema_fast": _finite(curr.get("ema_fast")),
+            "ema_mid": _finite(curr.get("ema_mid")),
+            "ema_slow": _finite(curr.get("ema_slow")),
+            "stack_bars": int(curr[stack_col]),
+            "bars_since_last_alert": since,
+        }
+    except Exception as exc:
+        print(f"[{TICKER}] failed to build alert context: {type(exc).__name__}: {exc}")
+        return {}
 
 
 def _status_snapshot(df):
@@ -1015,6 +1072,7 @@ def _poll(status):
         bar_time=str(df.index[-1]), signal=signal, tier=tier, depth=int(depth),
         strength=_finite(strength), price=_finite(latest["Close"]),
         sl=_finite(sl), tp=_finite(tp), rr=_finite(rr), risk=_finite(risk), reason=reason,
+        **_alert_context(df, last, signal),
     )
     save_last_signal(signal, tier, depth, df.index[-1])
     print(

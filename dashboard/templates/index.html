@@ -176,6 +176,42 @@
       <p class="muted small" id="history_empty" hidden></p>
     </section>
 
+    <section class="card area-stats" aria-labelledby="h_stats">
+      <div class="card-head">
+        <h2 id="h_stats">Outcomes by bucket</h2>
+        <div class="tools">
+          <select id="stats_source" aria-label="Which alerts">
+            <option value="live">Live</option>
+            <option value="backtest">Backtest</option>
+          </select>
+          <select id="stats_dim" aria-label="Split by">
+            <option value="depth">Depth</option>
+            <option value="signal">Direction</option>
+            <option value="tier">Tier</option>
+            <option value="session">Session (UTC)</option>
+            <option value="since_last">Bars since last alert</option>
+            <option value="stack_bars">Stack age</option>
+            <option value="strength">Strength</option>
+            <option value="prev_same_dir">Previous same-side alert</option>
+            <option value="overlaps_open">Earlier alert still open</option>
+          </select>
+        </div>
+        <p class="small history-summary" id="stats_summary"></p>
+      </div>
+      <div class="table-wrap">
+        <table class="history stats">
+          <thead>
+            <tr><th>Bucket</th><th class="num">n</th>
+                <th class="num" title="± one standard error">Win %</th>
+                <th class="num" title="Mean result per trade in R, ± one standard error">Mean R</th>
+                <th class="num">Net R</th><th></th></tr>
+          </thead>
+          <tbody id="stats_rows"></tbody>
+        </table>
+      </div>
+      <p class="muted small" id="stats_note"></p>
+    </section>
+
     <section class="card area-log" aria-labelledby="h_log">
       <div class="card-head">
         <h2 id="h_log">Log <span class="muted small" id="log_source"></span></h2>

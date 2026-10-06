@@ -15,6 +15,8 @@ const CHART_BARS_SHOWN = 120;
 const COUNTDOWN_INTERVAL = /^(?:(?:1|2|3|4|5|6|10|12|15|20|30)\s*m|1\s*h)$/i;
 // Failed polls in a row before the error state earns a banner, not just the badge.
 const ERROR_STREAK_BANNER = 3;
+// The resolver updates outcomes every 15 minutes; once a minute is plenty.
+const STATS_REFRESH_MS = 60000;
 
 const $ = (id) => document.getElementById(id);
 
@@ -46,6 +48,7 @@ const state = {
   logLines: [],
   lastRefresh: 0,
   refreshing: false,
+  statsAt: 0,
 };
 
 // ---- helpers ----
@@ -864,6 +867,69 @@ async function syncBars(status) {
   state.barsFor = key;
 }
 
+// ---- bucket stats ----
+
+const pct = (x) => `${Math.round(x * 100)}%`;
+
+function statsRow(b) {
+  const tr = el("tr", b.noise ? "noise" : "");
+  const winSe = el("span", "se", ` ±${Math.round(b.win_rate_se * 100)}`);
+  const win = el("td", "num", pct(b.win_rate));
+  win.append(winSe);
+  const mean = el("td", `num ${b.noise ? "" : b.mean_r > 0 ? "buy" : b.mean_r < 0 ? "sell" : ""}`,
+    fmtR(b.mean_r) || "–");
+  if (typeof b.se_r === "number") mean.append(el("span", "se", ` ±${b.se_r.toFixed(2)}`));
+  let flag;
+  if (b.noise) {
+    flag = el("td", "flag noise", "noise");
+    flag.title = "Too few trades to tell anything from breakeven";
+  } else if (b.sig_negative) {
+    flag = el("td", "flag sell", "losing");
+    flag.title = "Mean R is below zero even allowing for every bucket tested (Bonferroni)";
+  } else {
+    flag = el("td", "flag", "");
+  }
+  tr.append(el("td", "", String(b.bucket)), el("td", "num", String(b.n)), win, mean,
+    el("td", "num", fmtR(b.net_r) || "–"), flag);
+  return tr;
+}
+
+function renderStats(data) {
+  const body = $("stats_rows");
+  body.replaceChildren(...(data.buckets || []).map(statsRow));
+  const summary = $("stats_summary");
+  summary.replaceChildren();
+  const o = data.overall;
+  if (o) {
+    summary.append(
+      el("span", "", `${o.n} closed · `),
+      el("b", "", `${pct(o.win_rate)} won`),
+      el("span", "", " · "),
+      el("b", o.mean_r > 0 ? "buy" : o.mean_r < 0 ? "sell" : "", `${fmtR(o.mean_r)} per trade`),
+      el("span", "muted", ` ±${(o.se_r || 0).toFixed(2)} · breakeven ${pct(data.breakeven_win_rate)} ` +
+        `at ${data.rr}R before costs`),
+    );
+  } else {
+    summary.append(el("span", "muted", data.message || "No closed alerts yet"));
+  }
+  const note = [];
+  if (data.buckets && data.buckets.length) {
+    note.push(`Under ${data.min_n} trades a bucket is noise. With ${data.k} bucket` +
+      `${data.k === 1 ? "" : "s"} tested at 95%, ${(data.k * 0.05).toFixed(1)} would look ` +
+      `significant by chance alone, so "losing" needs z > ${data.z}.`);
+  }
+  if (data.source && data.source !== "live") note.push(`Source ${data.source}.`);
+  if (data.config_hash) note.push(`Current config ${data.config_hash} only.`);
+  $("stats_note").textContent = note.join(" ");
+}
+
+async function syncStats() {
+  state.statsAt = Date.now();
+  const by = encodeURIComponent($("stats_dim").value);
+  const source = encodeURIComponent($("stats_source").value);
+  renderStats(await getJSON(`/api/stats?by=${by}&source=${source}`));
+}
+
 // ---- logs ----
 
 function lineClass(line) {
@@ -954,6 +1020,7 @@ async function refresh(force = false) {
     if (!hidden) {
       await run("log", () => renderLogs(take(2)));
       if (status) await run("chart", () => syncBars(status));
+      if (Date.now() - state.statsAt > STATS_REFRESH_MS) await run("stats", syncStats);
     }
 
     // fetch() rejects with a TypeError only when the server cannot be reached.
@@ -1086,6 +1153,16 @@ document.addEventListener("DOMContentLoaded", () => {
     renderHistory();
   });
   $("history_csv").addEventListener("click", exportCsv);
+
+  for (const [id, key] of [["stats_dim", "dashboardStatsDim"], ["stats_source", "dashboardStatsSource"]]) {
+    const select = $(id);
+    const saved = prefs.get(key);
+    if ([...select.options].some((o) => o.value === saved)) select.value = saved;
+    select.addEventListener("change", () => {
+      prefs.set(key, select.value);
+      syncStats().catch((err) => toast(`Stats: ${err.message}`, "fail"));
+    });
+  }
 
   $("log_filter").addEventListener("input", drawLogs);
   $("log_follow").addEventListener("change", drawLogs);

@@ -1,0 +1,23 @@
+# Weekly advisory review of closed alerts. Writes reports/YYYY-MM-DD.md;
+# never touches the bot or .env.
+# Install with its timer, once resolve-alerts.timer has collected at least
+# REVIEW_MIN_N closed alerts under the current config (until then each run
+# only writes an "insufficient data" report):
+#   .venv/bin/pip install -r requirements-review.txt
+#   sudo cp deploy/review.service deploy/review.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now review.timer
+# Edit User and paths if not pi / /home/pi/Trading_Alerts.
+# Needs ANTHROPIC_API_KEY in .env. A failed run exits non-zero, so it shows in
+# systemctl --failed, and still leaves a report saying what went wrong.
+[Unit]
+Description=Weekly signal bot alert review
+After=network-online.target resolve-alerts.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+WorkingDirectory=/home/pi/Trading_Alerts
+EnvironmentFile=/home/pi/Trading_Alerts/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/pi/Trading_Alerts/.venv/bin/python review.py

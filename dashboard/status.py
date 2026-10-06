@@ -8,13 +8,15 @@ import math
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from outcomes import resolve
+import alert_log
+from outcomes import r_multiple, resolve
 
 ROOT = Path(__file__).resolve().parent.parent
 BOT_SERVICE = "signal-bot"
@@ -30,6 +32,7 @@ STATUS_FIELDS = (
     "last_poll_ok", "last_error", "consecutive_errors",
     "bars_loaded", "last_bar_time", "close", "ema_fast", "ema_mid", "ema_slow",
     "atr", "stack", "long_depth", "short_depth", "long_vetoed", "short_vetoed",
+    "config_hash",
 )
 STATE_FIELDS = ("signal", "tier", "depth", "bar_time")
 BAR_FIELDS = (
@@ -70,7 +73,7 @@ CONFIG_KEYS = {
     "poll_seconds": "POLL_SECONDS",
 }
 
-SECRET_ENV = ("DISCORD_WEBHOOK_URL", "OANDA_API_TOKEN", "DASHBOARD_TOKEN")
+SECRET_ENV = ("DISCORD_WEBHOOK_URL", "OANDA_API_TOKEN", "DASHBOARD_TOKEN", "ANTHROPIC_API_KEY")
 # Scheme and host optional: urllib3 connection errors quote only the path,
 # "Max retries exceeded with url: /api/webhooks/<id>/<token>".
 WEBHOOK_RE = re.compile(
@@ -107,6 +110,11 @@ def bars_path():
 
 def alerts_path():
     return ROOT / f".alerts_{ticker()}.jsonl"
+
+
+def db_path():
+    """The resolver's durable alert log. Opened read-only, never created here."""
+    return alert_log.db_path(ROOT, ticker())
 
 
 def _read_json(path):
@@ -277,13 +285,114 @@ def add_outcomes(alerts, bars):
             a["unknown_reason"] = "missing_bar"
             continue
         a["outcome"] = outcome
-        if outcome == "win":
-            a["r"] = round(abs(tp - price) / abs(price - sl), 2)
-        elif outcome == "loss":
-            a["r"] = -1.0
+        r = r_multiple(outcome, price, sl, tp)
+        a["r"] = None if r is None else round(r, 2)
         if exit_i is not None:
             a["exit_ts"] = bars[exit_i]["ts"]
     return alerts
+
+
+def _open_log():
+    """(connection, message): the resolver's alert log read-only, or why not."""
+    try:
+        return alert_log.connect(db_path(), readonly=True), None
+    except FileNotFoundError:
+        return None, "no alert log yet: run resolve_alerts.py"
+    except sqlite3.Error as exc:
+        return None, f"{db_path().name} unreadable: {type(exc).__name__}"
+
+
+def add_logged_outcomes(alerts, ids):
+    """
+    Replace what the bars file could say with the resolver's result for any
+    alert it has closed. The resolver walks full OANDA history, so this is
+    what turns alerts older than the bars file from unknown into a result.
+    Alerts it has not closed keep the bars-file view, live R included.
+    Without a readable log, nothing changes.
+    """
+    wanted = [i for i in ids if isinstance(i, str)]
+    if not wanted:
+        return alerts
+    conn, _ = _open_log()
+    if conn is None:
+        return alerts
+    found = {}
+    try:
+        for start in range(0, len(wanted), 500):
+            part = wanted[start:start + 500]
+            for row in conn.execute(
+                "SELECT alert_id, outcome, r, exit_time FROM alerts WHERE source = 'live' "
+                f"AND outcome IN ('win', 'loss') AND alert_id IN ({', '.join('?' * len(part))})",
+                part,
+            ):
+                found[row["alert_id"]] = row
+    except sqlite3.Error:
+        return alerts
+    finally:
+        conn.close()
+    for a, alert_id in zip(alerts, ids):
+        row = found.get(alert_id)
+        if row is None:
+            continue
+        a.update(
+            outcome=row["outcome"],
+            r=None if row["r"] is None else round(row["r"], 2),
+            exit_ts=_epoch(row["exit_time"]),
+            unknown_reason=None,
+        )
+    return alerts
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+
+def load_stats(dim, source="live"):
+    """
+    Win rate and mean R for each bucket of one dimension, from the resolver's
+    log. Live alerts are limited to the config the bot is running now (the
+    status file's config_hash), so a settings change starts a fresh sample;
+    "backtest" means the most recent backtest.py --db run. Buckets under
+    STATS_MIN_N trades are flagged as noise.
+    """
+    base = {"dim": dim, "dims": list(alert_log.DIMENSIONS), "source": source,
+            "config_hash": None, "n": 0, "buckets": [], "overall": None}
+    if dim not in alert_log.DIMENSIONS:
+        return {**base, "message": f"unknown dimension {dim!r}"}
+    if source not in ("live", "backtest"):
+        return {**base, "message": f"unknown source {source!r}"}
+    conn, message = _open_log()
+    if conn is None:
+        return {**base, "message": message}
+    config = None
+    try:
+        if source == "backtest":
+            src = alert_log.latest_backtest_source(conn)
+            if src is None:
+                return {**base, "message": "no backtest in the alert log: run backtest.py --db"}
+        else:
+            src = "live"
+            status, _ = _read_json(status_path())
+            if isinstance(status, dict) and isinstance(status.get("config_hash"), str):
+                config = status["config_hash"]
+        rows = alert_log.load_rows(conn, src, config_hash=config)
+    except sqlite3.Error as exc:
+        return {**base, "message": f"{db_path().name} unreadable: {type(exc).__name__}"}
+    finally:
+        conn.close()
+
+    stats = alert_log.bucket_stats(
+        alert_log.annotate(rows), [dim],
+        min_n=int(_env_float("STATS_MIN_N", 30)), rr=_env_float("SIGNAL_RR", 1.5),
+    )
+    return {
+        **base, **stats, "source": src, "config_hash": config,
+        "message": None if stats["n"] else "no closed alerts yet"
+        + (" under the current config" if config else ""),
+    }
 
 
 def outcome_summary(alerts):
@@ -318,7 +427,7 @@ def load_alerts(n):
         return {**empty, "message": "no alerts logged yet"}
     except OSError as exc:
         return {**empty, "message": f"{path.name} unreadable: {type(exc).__name__}"}
-    alerts, skipped = [], 0
+    alerts, ids, skipped = [], [], 0
     for line in reversed(lines):
         if not line.strip():
             continue
@@ -331,8 +440,11 @@ def load_alerts(n):
             continue
         alerts.append({**{k: _clean(raw.get(k)) for k in ALERT_FIELDS},
                        "ts": _epoch(raw.get("bar_time"))})
+        ids.append(raw.get("alert_id") or alert_log.make_alert_id(
+            os.environ.get("SIGNAL_TICKER", ""), raw.get("signal"), raw.get("bar_time")))
     bars = load_bars()
     add_outcomes(alerts, bars["bars"])
+    add_logged_outcomes(alerts, ids)
     return {
         "alerts": alerts,
         "skipped": skipped,

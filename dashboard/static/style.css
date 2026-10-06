@@ -163,6 +163,7 @@ code { font-size: 0.9em; }
       "chart   chart"
       "market  poll"
       "history history"
+      "stats   stats"
       "actions actions"
       "log     log"
       "config  config";
@@ -176,6 +177,7 @@ code { font-size: 0.9em; }
       "chart   chart   setup"
       "market  poll    actions"
       "history history history"
+      "stats   stats   stats"
       "log     log     log"
       "config  config  config";
   }
@@ -187,6 +189,7 @@ code { font-size: 0.9em; }
 .area-poll { grid-area: poll; }
 .area-actions { grid-area: actions; }
 .area-history { grid-area: history; }
+.area-stats { grid-area: stats; }
 .area-log { grid-area: log; }
 .area-config { grid-area: config; }
 /* Below 760px the grid has no areas, so DOM order (alert first) applies. */
@@ -311,10 +314,19 @@ code { font-size: 0.9em; }
 .history .open { color: var(--warn); }
 .history-summary, .history-note { order: 3; flex-basis: 100%; font-variant-numeric: tabular-nums; }
 .history-note { order: 4; }
-#history_filter {
+#history_filter, #stats_source, #stats_dim {
   font: inherit; font-size: 0.78rem; padding: 3px 6px; border-radius: 8px;
   border: 1px solid var(--border); background: var(--bg); color: var(--text);
 }
+
+/* ---- bucket stats ---- */
+.stats tbody tr { cursor: default; }
+.stats tbody tr:hover { background: none; }
+/* Too few trades to mean anything: shown, but visibly not to be read into. */
+.stats tr.noise td { color: var(--muted); }
+.stats .flag { font-size: 0.75rem; font-weight: 600; }
+.stats .flag.noise { color: var(--muted); font-weight: 400; }
+.stats .se { color: var(--muted); font-size: 0.8em; }
 
 /* ---- log ---- */
 pre {

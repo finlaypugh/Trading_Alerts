@@ -1,0 +1,13 @@
+# Runs resolve-alerts.service every 15 minutes, and once at boot if a run was
+# missed while the Pi was off. The bot keeps only its newest 500 alerts, so
+# this has to run well within the days that takes to fill.
+[Unit]
+Description=Resolve signal bot alert outcomes every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,4 @@
+# Only for review.py's LLM step. The bot and dashboard never need it.
+#   pip install -r requirements-review.txt
+-r requirements.txt
+anthropic

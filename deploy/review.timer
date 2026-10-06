@@ -1,0 +1,11 @@
+# Saturday midday UTC: gold is shut from Friday evening to Sunday evening, so
+# the week's alerts have all resolved by then. Catches up at boot if missed.
+[Unit]
+Description=Weekly signal bot alert review
+
+[Timer]
+OnCalendar=Sat *-*-* 12:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

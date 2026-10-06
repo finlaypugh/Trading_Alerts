@@ -1368,11 +1368,15 @@ class TestAppendAlert:
         assert alert["rr"] == signal_bot.RR
         assert alert["reason"] == "test reason"
 
-    def test_run_once_logs_exactly_the_fields_the_dashboard_reads(self, run_once_env, monkeypatch):
+    def test_run_once_logs_the_dashboard_fields_plus_the_alert_context(
+        self, run_once_env, monkeypatch
+    ):
         monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
         signal_bot.run_once()
         (alert,) = read_alerts()
-        assert set(alert) == set(dashboard_status.ALERT_FIELDS)
+        assert set(alert) == (
+            set(dashboard_status.ALERT_FIELDS) | set(signal_bot.ALERT_CONTEXT_FIELDS)
+        )
 
     def test_a_failed_alert_log_does_not_cause_a_resend(
         self, run_once_env, monkeypatch, tmp_path
@@ -1409,6 +1413,95 @@ class TestAppendAlert:
         except signal_bot.requests.HTTPError:
             pass
         assert not signal_bot.ALERTS_FILE.exists()
+
+
+class TestAlertContext:
+    """The extra fields the alert log records, for outcome analysis."""
+
+    def test_sent_alert_carries_its_context(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.save_last_signal("SELL", "STRONG", 1, str(run_once_env.index[-7]))
+        signal_bot.run_once()
+        (alert,) = read_alerts()
+        bar_utc = run_once_env.index[-1].tz_localize("UTC").isoformat()
+        assert alert["alert_id"] == f"TESTTICKER|BUY|{bar_utc}"
+        assert alert["ticker"] == "TESTTICKER"
+        assert alert["interval"] == signal_bot.INTERVAL
+        assert alert["config_hash"] == signal_bot.config_hash()
+        assert alert["atr"] == 10.0
+        assert (alert["ema_fast"], alert["ema_mid"], alert["ema_slow"]) == (110.0, 105.0, 100.0)
+        assert alert["stack_bars"] == SETTLED
+        assert alert["bars_since_last_alert"] == 6
+
+    def test_short_reads_the_bear_stack_count(self, run_once_env, monkeypatch):
+        run_once_env.curr = dict(SELL_CURR, bear_stack_bars=7)
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub(signal="SELL", depth=1))
+        signal_bot.run_once()
+        assert read_alerts()[0]["stack_bars"] == 7
+
+    def test_first_alert_has_no_bars_since(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.run_once()
+        assert read_alerts()[0]["bars_since_last_alert"] is None
+
+    def test_previous_alert_older_than_the_frame_is_unknown_not_a_floor(
+        self, run_once_env, monkeypatch
+    ):
+        # Every bar in the frame closed after it, which says "at least n",
+        # not n. Recorded as unknown rather than as a misleading count.
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        signal_bot.save_last_signal("BUY", "STRONG", 1, "2020-01-01 00:00:00")
+        signal_bot.run_once()
+        assert read_alerts()[0]["bars_since_last_alert"] is None
+
+    def test_a_context_failure_still_sends_and_logs_the_alert(self, run_once_env, monkeypatch):
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+
+        def boom(*a, **k):
+            raise RuntimeError("bad id")
+
+        monkeypatch.setattr(signal_bot.alert_log, "make_alert_id", boom)
+        signal_bot.run_once()
+        assert len(run_once_env.sent) == 1
+        assert read_status()["result"] == "sent"
+        (alert,) = read_alerts()
+        assert alert["signal"] == "BUY"
+        assert "alert_id" not in alert
+        assert signal_bot.load_last_signal()["signal"] == "BUY"
+
+    def test_context_is_built_after_the_discord_send(self, run_once_env, monkeypatch):
+        order = []
+        monkeypatch.setattr(signal_bot, "detect_signal", detect_stub())
+        monkeypatch.setattr(signal_bot, "send_discord_alert", lambda *a, **k: order.append("send"))
+        real = signal_bot._alert_context
+        monkeypatch.setattr(
+            signal_bot, "_alert_context",
+            lambda *a: order.append("context") or real(*a),
+        )
+        signal_bot.run_once()
+        assert order == ["send", "context"]
+
+
+class TestConfigHash:
+    def test_stable_for_the_same_settings(self):
+        assert signal_bot.config_hash() == signal_bot.config_hash()
+
+    @pytest.mark.parametrize("name,value", [
+        ("RR", 2.0), ("MIN_STACK_BARS", 9), ("COOLDOWN_BARS", 1), ("INTERVAL", "5m"),
+    ])
+    def test_changes_with_any_strategy_setting(self, monkeypatch, name, value):
+        before = signal_bot.config_hash()
+        monkeypatch.setattr(signal_bot, name, value)
+        assert signal_bot.config_hash() != before
+
+    def test_ignores_the_poll_rate(self, monkeypatch):
+        before = signal_bot.config_hash()
+        monkeypatch.setattr(signal_bot, "POLL_SECONDS", 5)
+        assert signal_bot.config_hash() == before
+
+    def test_status_file_carries_it(self):
+        signal_bot.write_status(result="no_setup")
+        assert read_status()["config_hash"] == signal_bot.config_hash()
 
 
 class TestOandaGranularity:

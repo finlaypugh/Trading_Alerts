@@ -62,6 +62,11 @@ def parse_args(argv=None):
              "so their effect on the numbers is measured rather than assumed",
     )
     p.add_argument("--csv", default=None, help="write the trade list to this path")
+    p.add_argument(
+        "--db", action="store_true",
+        help="also add the trades to the alert log (.alerts_<instrument>.db) as a "
+             "backtest:<time> source, for the dashboard and review.py to compare against",
+    )
     return p.parse_args(argv)
 
 
@@ -75,8 +80,9 @@ os.environ.setdefault("DISCORD_WEBHOOK_URL", "https://example.invalid/backtest-o
 os.environ["SIGNAL_TICKER"] = ARGS.instrument
 os.environ["SIGNAL_INTERVAL"] = GRANULARITY_TO_INTERVAL[ARGS.granularity]
 
+import alert_log  # noqa: E402
 import signal_bot  # noqa: E402  (must follow the env setup above)
-from outcomes import resolve  # noqa: E402  (shared with the dashboard)
+from outcomes import r_multiple, resolve  # noqa: E402  (shared with the dashboard)
 
 
 def fetch_history(instrument, granularity, days, environment, token=None, end=None):
@@ -96,6 +102,8 @@ def run(df):
     trades = []
     open_until = -1          # bar index the current position closes on
     last_entry = {"BUY": None, "SELL": None}
+    last_any = None          # for bars_since_last_alert, as the live bot logs it
+    config = signal_bot.config_hash()
     highs = df["High"].to_numpy(dtype=float)
     lows = df["Low"].to_numpy(dtype=float)
 
@@ -121,6 +129,8 @@ def run(df):
 
         sl, tp, rr, risk = levels
         outcome, exit_i = resolve(highs, lows, i, signal, sl, tp)
+        r = r_multiple(outcome, float(bar["Close"]), float(sl), float(tp))
+        stack_col = "bull_stack_bars" if signal == "BUY" else "bear_stack_bars"
         trades.append(
             {
                 "entry_time": df.index[i],
@@ -134,11 +144,22 @@ def run(df):
                 "tp": round(float(tp), 2),
                 "risk": round(float(risk), 2),
                 "outcome": outcome,
-                "r": rr if outcome == "win" else (-1.0 if outcome == "loss" else 0.0),
+                "r": 0.0 if r is None else round(r, 4),
                 "bars_held": None if exit_i is None else exit_i - i,
+                # The context the live bot logs with each alert, so the two
+                # can be bucketed the same way.
+                "rr": rr,
+                "atr": round(float(bar["atr"]), 4),
+                "ema_fast": round(float(bar["ema_fast"]), 4),
+                "ema_mid": round(float(bar["ema_mid"]), 4),
+                "ema_slow": round(float(bar["ema_slow"]), 4),
+                "stack_bars": int(bar[stack_col]),
+                "bars_since_last_alert": None if last_any is None else i - last_any,
+                "config_hash": config,
             }
         )
         last_entry[signal] = i
+        last_any = i
         open_until = exit_i if exit_i is not None else len(df)
 
     return trades
@@ -265,8 +286,30 @@ def main():
         return 1
 
     df = signal_bot.compute_indicators(df)
-    report(run(df), df, args)
+    trades = run(df)
+    report(trades, df, args)
+    if args.db:
+        write_db(trades, signal_bot.TICKER, signal_bot.INTERVAL)
     return 0
+
+
+def write_db(trades, ticker, interval, path=None, now=None):
+    """
+    Add this run's trades to the alert log under their own backtest:<time>
+    source. Never pooled with live alerts: one position at a time and a
+    per-direction cooldown make this a different population.
+    """
+    now = now or pd.Timestamp.now(tz="UTC")
+    source = f"backtest:{now.isoformat(timespec='seconds')}"
+    path = path or alert_log.db_path(os.path.dirname(os.path.abspath(__file__)), ticker)
+    conn = alert_log.connect(path)
+    try:
+        added = alert_log.import_trades(conn, trades, source, ticker, interval)
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"  {added} trades added to {os.path.basename(path)} as {source}\n")
+    return source
 
 
 if __name__ == "__main__":

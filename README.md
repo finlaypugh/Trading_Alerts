@@ -119,6 +119,110 @@ Security:
   use [Tailscale](https://tailscale.com) and open
   `http://<pi-tailscale-name>:8080`.
 
+## Outcome log
+
+The bot's `.alerts_<ticker>.jsonl` keeps only the newest 500 alerts, and the
+dashboard can only judge alerts its bars file still covers. `resolve_alerts.py`
+keeps every alert and how it ended, in `.alerts_<ticker>.db` (SQLite, git-ignored):
+it copies new lines from the bot's file, fetches OANDA candles from each
+unresolved alert's bar onward, and applies the same rule as the backtest
+(`outcomes.py`). It is the only writer; the bot never opens the database, and
+the dashboard reads it read-only.
+
+```bash
+./run_resolver.sh             # once: ingest + resolve (run_resolver.bat on Windows)
+./run_resolver.sh --dry-run   # what would change, nothing written
+python resolve_alerts.py backfill trades.csv --source backtest:legacy
+```
+
+On the Pi, run it every 15 minutes with the timer:
+
+```bash
+sudo cp deploy/resolve-alerts.service deploy/resolve-alerts.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now resolve-alerts.timer
+```
+
+Re-running is always safe: a closed alert is never rewritten, and an open one
+is walked again from its own bar. If OANDA fails, the new alerts are still
+copied and nothing else changes until the next run. An alert still open after
+`RESOLVE_MAX_HOLD_DAYS` is marked expired and left out of the statistics. An
+exit bar that opened beyond the stop is flagged `exit_gapped`, because the real
+fill was worse than −1R.
+
+Each alert is logged with the context it fired in: ATR, the EMAs, how long the
+stack had held, bars since the previous alert, and `config_hash`, a
+fingerprint of every strategy setting. The dashboard's **Outcomes by bucket**
+card splits closed alerts by depth, direction, session, bars since the last
+alert, stack age, strength, how the previous same-side alert stood, and whether
+an earlier alert was still open. It shows n, win rate and mean R, each ± one
+standard error. Read it with care:
+
+- Only alerts under the bot's current `config_hash` are counted, so changing a
+  setting starts a fresh sample.
+- Buckets under `STATS_MIN_N` alerts (default 30) are greyed out as noise.
+  Even at 100 alerts, mean R is only known to about ±0.12R.
+- "losing" means mean R is below zero by more than a Bonferroni-corrected
+  margin across every bucket shown. Test enough buckets and some will look bad
+  by chance.
+- Breakeven at 1.5R is a 40% win rate, before spread and slippage.
+
+`python backtest.py --db` adds a backtest's trades under their own
+`backtest:<time>` source, which the card's Backtest option shows. They are
+never pooled with live alerts: the backtest holds one position at a time and
+counts its cooldown per direction, and the live bot does neither.
+
+## Weekly review
+
+`review.py` turns the outcome log into a dated report in `reports/`
+(git-ignored), optionally with an LLM's reading of it. It is advisory only:
+it never touches the bot or `.env`, and neither the bot nor the dashboard
+imports it.
+
+```bash
+python review.py --no-llm     # statistics only, no API call
+python review.py --dry-run    # print the prompt it would send; nothing called or written
+pip install -r requirements-review.txt
+python review.py              # statistics + the model's reading (needs ANTHROPIC_API_KEY)
+```
+
+The statistics are computed in code, and the guardrails are in code too, not
+just in the prompt:
+
+- Below `REVIEW_MIN_N` closed alerts (default 100) under the current config,
+  no model is asked. The report says there is not enough data.
+- The model refers to buckets by id. Every number in the report comes from the
+  code, and the model's prose is labelled as its reading.
+- A proposed `.env` change survives only if every bucket it cites has at least
+  `REVIEW_BUCKET_MIN_N` alerts and is losing after a Bonferroni correction
+  across all buckets. The setting must also be on a short allowlist that
+  excludes the hard constraints in `docs/LEARNINGS.md` (fractal lag,
+  closed candles, session gaps). Surviving proposals are printed as a diff,
+  each with a backtest command to run first. Rejected ones are listed with
+  the reason.
+- Any failure (API error, refusal, malformed answer) still writes a report
+  with the statistics, and exits 1.
+
+`docs/LEARNINGS.md` is sent with every review: the hard constraints, how to
+read the numbers, and past findings with their sample sizes. Keep it up to
+date by hand.
+
+The default model is `claude-opus-5-5` (`REVIEW_MODEL`). One run sends about
+20-30k tokens and costs roughly $0.20-0.30, about $1-1.30 a month weekly.
+`claude-sonnet-5-5` costs about half. Requests opt into Anthropic's
+server-side fallback, so a policy decline is retried on another model within
+the same call.
+
+On the Pi, install the weekly timer (Saturday 12:00 UTC, with the market
+shut) once the resolver has collected enough alerts:
+
+```bash
+sudo cp deploy/review.service deploy/review.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now review.timer
+```
+
+Set `REVIEW_POST_DISCORD=true` to also post a short summary to the alert
+channel.
+
 ## The strategy
 
 Stated the way the source material states it:
@@ -205,6 +309,7 @@ python backtest.py --granularity M15 --csv trades.csv
 | `--days` | `60` | History ending now. |
 | `--baseline` | off | Pivot-in-pullback and stack-stability gates off. |
 | `--csv` | — | Write the trade list to this path. |
+| `--db` | off | Also add the trades to `.alerts_<instrument>.db` as a `backtest:<time>` source. |
 
 Entries fill at the close of the confirmation bar, one position at a time,
 honouring `SIGNAL_COOLDOWN_BARS`. When one bar's range covers both the stop
@@ -275,6 +380,18 @@ is the annotated copy; this table is the complete list.
 | `DASHBOARD_HOST` | `0.0.0.0` | Dashboard bind address. |
 | `DASHBOARD_PORT` | `8080` | Dashboard port. |
 | `DASHBOARD_LOG_FILE` | — | Log file for the dashboard's log panel. Unset = `journalctl -u signal-bot`. |
+| `RESOLVE_MAX_HOLD_DAYS` | `5` | Days an alert may stay open before the resolver marks it expired. |
+| `STATS_MIN_N` | `30` | Dashboard bucket stats: smaller buckets are shown as noise. |
+| `ANTHROPIC_API_KEY` | — | `review.py`'s LLM step only. |
+| `REVIEW_MODEL` | `claude-opus-5-5` | Reviewer model. |
+| `REVIEW_EFFORT` | `high` | `low` … `max`. |
+| `REVIEW_WINDOW_DAYS` | `28` | Alerts closed in this many days are reviewed… |
+| `REVIEW_MAX_ALERTS` | `400` | …the newest this many of them. |
+| `REVIEW_MIN_N` | `100` | Fewer closed alerts than this: no model is asked. |
+| `REVIEW_BUCKET_MIN_N` | `30` | Smaller buckets can never justify a proposal. |
+| `REVIEW_ALPHA` | `0.05` | Significance level, before the Bonferroni correction. |
+| `REVIEW_REPORTS_DIR` | `reports` | Where reports are written. |
+| `REVIEW_POST_DISCORD` | `false` | Also post a summary to `DISCORD_WEBHOOK_URL`. |
 
 Alerts are throttled by state in `.state_<ticker>.json`: an opposite-direction
 signal always goes through, a same-direction one waits `SIGNAL_COOLDOWN_BARS`

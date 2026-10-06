@@ -8,3 +8,6 @@ __pycache__/
 .alerts_*
 .idea/
 .pytest_cache/
+# Trading results stay local: backtest trade lists and review.py reports.
+trades*.csv
+reports/
